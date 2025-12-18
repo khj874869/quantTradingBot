@@ -1,0 +1,2 @@
+[console_scripts]
+quantbot = quantbot.main:main

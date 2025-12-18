@@ -53,7 +53,7 @@ python -m quantbot.main --mode live --venue upbit \
 
 ### Binance (spot)
 ```bash
-python -m quantbot.main --mode live --venue binance \
+python -m quantbot.main --mode live --venue binance --symbols BTCUSDT --entry-tf 15m --notional 50
   --symbols BTCUSDT,ETHUSDT --entry-tf 15m --notional 100
 ```
 

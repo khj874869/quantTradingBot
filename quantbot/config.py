@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     BINANCE_API_KEY: str | None = None
     BINANCE_API_SECRET: str | None = None
     BINANCE_FUTURES: bool = False
+    BINANCE_BASE_URL: str = "https://api.binance.com"
 
     KIS_APP_KEY: str | None = None
     KIS_APP_SECRET: str | None = None

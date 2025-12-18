@@ -18,10 +18,10 @@ from quantbot.risk.risk_manager import RiskManager, PortfolioState
 from quantbot.execution.executor import OrderExecutor
 from quantbot.execution.adapters.upbit_adapter import UpbitAdapter
 from quantbot.execution.adapters.binance_adapter import BinanceAdapter
+from quantbot.execution.adapters.binance_futures_adapter import BinanceFuturesAdapter
 from quantbot.execution.adapters.namoo_adapter import NamooAdapter
 from quantbot.execution.adapters.kis_adapter import KISAdapter
 from quantbot.utils.time import utc_now
-
 from quantbot.collectors.upbit_rest import fetch_upbit_candles, fetch_upbit_orderbook
 from quantbot.collectors.binance_rest import fetch_binance_klines, fetch_binance_orderbook
 
@@ -126,22 +126,39 @@ async def _orderbook_score(venue: str, symbol: str) -> float:
     except Exception:
         return 0.0
 
-
 def _make_adapter(venue: str):
     if venue == "upbit":
         if not settings.UPBIT_ACCESS_KEY or not settings.UPBIT_SECRET_KEY:
             raise RuntimeError("Set UPBIT_ACCESS_KEY/UPBIT_SECRET_KEY in .env")
         return UpbitAdapter(settings.UPBIT_ACCESS_KEY, settings.UPBIT_SECRET_KEY)
+
     if venue == "binance":
         if not settings.BINANCE_API_KEY or not settings.BINANCE_API_SECRET:
             raise RuntimeError("Set BINANCE_API_KEY/BINANCE_API_SECRET in .env")
-        return BinanceAdapter(settings.BINANCE_API_KEY, settings.BINANCE_API_SECRET)
+
+        base_url = settings.BINANCE_BASE_URL  # config.py에 추가 필요
+
+        if settings.BINANCE_FUTURES:
+            return BinanceFuturesAdapter(
+                api_key=settings.BINANCE_API_KEY,
+                api_secret=settings.BINANCE_API_SECRET,
+                base_url=base_url,
+            )
+
+        return BinanceAdapter(
+            api_key=settings.BINANCE_API_KEY,
+            api_secret=settings.BINANCE_API_SECRET,
+            base_url=base_url,
+        )
+
     if venue == "namoo":
         return NamooAdapter(settings.NAMOO_BRIDGE_URL)
+
     if venue == "kis":
         if not (settings.KIS_APP_KEY and settings.KIS_APP_SECRET and settings.KIS_ACCOUNT_NO and settings.KIS_PRODUCT_CODE):
             raise RuntimeError("Set KIS_* in .env")
         return KISAdapter(settings.KIS_APP_KEY, settings.KIS_APP_SECRET, settings.KIS_ACCOUNT_NO, settings.KIS_PRODUCT_CODE, settings.KIS_BASE_URL)
+
     raise ValueError(f"Unsupported venue: {venue}")
 
 

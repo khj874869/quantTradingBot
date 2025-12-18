@@ -108,21 +108,17 @@ def main():
     if args.mode == "demo":
         asyncio.run(run_demo())
     else:
-        from quantbot.live import run_live, LiveConfig
-        symbols = [s.strip() for s in (args.symbols or "").split(",") if s.strip()]
-        if not symbols:
-            console.print("[red]--symbols is required in live mode[/red]")
-            return
-        feeds = [s.strip() for s in (args.news_feeds or "").split(",") if s.strip()]
-        cfg = LiveConfig(
-            venue=args.venue,
-            symbols=symbols,
-            entry_tf=args.entry_tf,
-            poll_sec=int(args.poll_sec),
-            news_feeds=feeds,
-            intended_notional=float(args.notional),
-        )
-        asyncio.run(run_live(cfg))
+     from quantbot.live import run_live, LiveConfig
+    cfg = LiveConfig(
+        venue=args.venue,
+        symbols=[s.strip() for s in (args.symbols or "").split(",") if s.strip()],
+        entry_tf=args.entry_tf,
+        poll_sec=int(args.poll_sec),
+        news_feeds=[s.strip() for s in (args.news_feeds or "").split(",") if s.strip()],
+        intended_notional=float(args.notional),
+    )
+    asyncio.run(run_live(cfg))
+
 
 if __name__ == "__main__":
     main()

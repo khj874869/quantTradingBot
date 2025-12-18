@@ -1,0 +1,2 @@
+ts,venue,symbol,side,status,qty,px,fee,client_order_id,order_id,pos_qty,avg_cost,realized_pnl,realized_pnl_net
+2025-12-18 04:17:49.864827+00:00,demo,DEMOCOIN-KRW,BUY,FILLED,886.706522179899,112.77688558572657,0.0,demo-DEMOCOIN-KRW-BUY-44a1ec74990921c86ca0,DEMO-0921c86ca0,886.706522179899,112.77688558572657,0.0,0.0

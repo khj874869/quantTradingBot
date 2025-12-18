@@ -20,3 +20,4 @@ class KeywordScorer:
                 hits.append(f"-{k}")
                 score -= 2.0
         return score, hits
+
