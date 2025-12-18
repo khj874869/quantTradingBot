@@ -19,7 +19,7 @@ class BlenderWeights:
 
 def _trend_score(last_d: pd.Series) -> float:
     score = 0.0
-    # (요청) MA(30/120/200/864) 역배열: 장기 하락추세 + 바닥권 후보
+    #  MA(30/120/200/864) 역배열: 장기 하락추세 + 바닥권 후보
     if inverse_alignment(last_d):
         score += 1.5
 

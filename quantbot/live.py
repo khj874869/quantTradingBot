@@ -253,7 +253,15 @@ async def run_live(cfg: LiveConfig):
                     positions=positions,
                     prices={symbol: float(last_price)},
                 )
-
+                # api demo 연계 됐는지 추 후 확인할 로그
+                # if cfg.venue == "binance" and getattr(settings, "BINANCE_FUTURES", False):
+                #     await adapter.set_leverage("BTCUSDT", 2)
+                #     px = await adapter.get_last_price("BTCUSDT")
+                #     qty = 0.001  # 최소수량이 더 크면 0.002 같은 값으로
+                #     sig = Signal(ts=utc_now(), venue="binance", symbol="BTCUSDT", side="BUY", score=999)
+                #     res = await executor.execute_from_signal(sig, qty=qty, order_type="MARKET")
+                #     console.print(res)
+                # # --- end smoke test ---
                 ok, why = rm.approve(pf, sig, intended_notional=cfg.intended_notional)
                 if not ok:
                     continue
