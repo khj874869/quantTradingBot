@@ -84,3 +84,22 @@ async def fetch_binance_orderbook(symbol: str, limit: int = 50) -> Any:
         return r.json()
     finally:
         await client.aclose()
+
+
+
+async def fetch_binance_recent_trades(symbol: str, limit: int = 500) -> list[dict]:
+    """Public recent trades.
+
+    Response includes `time` (ms) and `isBuyerMaker`:
+      - isBuyerMaker = True  -> buyer is maker (seller is taker) -> sell pressure
+      - isBuyerMaker = False -> buyer is taker -> buy pressure
+    """
+    s = _norm_symbol(symbol)
+    client = httpx.AsyncClient(timeout=10)
+    try:
+        r = await client.get(BASE_URL + "/api/v3/trades", params={"symbol": s, "limit": int(limit)})
+        r.raise_for_status()
+        data = r.json()
+        return data if isinstance(data, list) else []
+    finally:
+        await client.aclose()

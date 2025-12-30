@@ -8,6 +8,8 @@
 - Indicators: SMA(30/120/200/864), RSI(14), Bollinger Bands(20,2), volume surge, Fibonacci levels
 - News listener: keyword scoring with positive/negative lists
 - Strategy: "Blender score" that blends trend + RSI + volume + news (+ orderbook hooks)
+- WebSocket executed-trade pressure stream for scalp (Upbit/Binance) with REST fallback when stale
+
 - Execution adapters:
   - 나무증권: `NamooAdapter` (HTTP bridge; see `namoo_bridge/`)
   - Upbit (spot): REST trading + account + price
@@ -38,6 +40,29 @@ Copy `.env.example` to `.env` and fill values.
 Runs with mock market data (so you can test the pipeline end-to-end):
 ```bash
 python -m quantbot.main --mode demo
+```
+
+
+
+## Paper trading
+
+실제 주문 없이(모의 체결) **실시간 시세로** 전략/리스크/체결 로직을 검증합니다.
+
+### Upbit (paper)
+```bash
+python -m quantbot.main --mode paper --venue upbit   --strategy blender   --symbols KRW-BTC   --entry-tf 15m --poll-sec 30   --paper-cash 1000000 --paper-fee-bps 10 --paper-slippage-bps 5
+```
+
+## Scalping mode (5초 루프 + 거래대금/호가잔량 필터 + 즉시 익절)
+
+- 5초마다 신호/포지션을 체크합니다.
+- **거래량(1분 캔들 거래대금)** 및 **호가잔량(상위 depth 기준 notional)** 로 유동성 필터를 걸 수 있습니다.
+- 익절: 수수료(왕복) 반영 후 **0.39%** 수익이면 즉시 청산 (`--take-profit-net-pct 0.0039`)
+  - 레버리지 10배 가정 시: 계좌 수익률 ~3.9% (가격 변동은 동일)
+
+### Upbit (paper scalp)
+```bash
+python -m quantbot.main --mode paper --venue upbit   --strategy scalp   --symbols KRW-BTC   --entry-tf 1m --poll-sec 5   --take-profit-net-pct 0.0039 --leverage 10   --scalp-min-1m-trade-value 50000000   --scalp-min-orderbook-notional 100000000   --paper-cash 1000000 --paper-fee-bps 10 --paper-slippage-bps 5
 ```
 
 ## Live usage examples
@@ -120,3 +145,21 @@ BOT_NOTIONAL=100000
 - 나무/QV OpenAPI는 Windows(32-bit DLL) 제약이 있어, `namoo_bridge/`를 **Windows PC**에서 실행하고
   봇은 해당 브릿지를 HTTP로 호출하는 형태를 권장합니다.
 - 포트(기본 8700)를 인터넷에 그대로 노출하지 말고, **VPN(Tailscale 등)** 또는 **SSH 터널링**을 권장합니다.
+
+
+## Scalp mode (RSI + executed-trade pressure)
+
+Example (Upbit):
+```bash
+quantbot --mode paper --venue upbit --strategy scalp --symbols KRW-BTC \
+  --entry-tf 1m --poll-sec 5 --notional 100000 \
+  --take-profit-net-pct 0.0039 --stop-loss-pct 0.01 --trailing-stop-pct 0.005 \
+  --scalp-pressure-window-sec 15 --scalp-trade-pressure-threshold 0.20 \
+  --scalp-use-ws-trades 1 --scalp-ws-staleness-sec 30 \
+  --scalp-max-spread-bps 8 --scalp-max-1m-range-pct 0.012 --scalp-max-1m-body-pct 0.010 \
+  --scalp-news-spike-tv-mult 5 --scalp-news-spike-move-pct 0.007 --scalp-news-cooldown-sec 300
+```
+
+Notes:
+- `--scalp-use-ws-trades 1` uses real-time trade stream to compute pressure; if no ticks arrive for `--scalp-ws-staleness-sec`, it falls back to REST.
+- Spread/volatility/news-candle filters are optional; set them to 0 to disable.

@@ -156,7 +156,7 @@ class KISAdapter(BrokerAdapter):
                 avg_fill_price=None,
                 fee=None,
                 ts=utc_now(),
-                meta={"raw": data},
+                raw=data,
             )
         except Exception as e:
             return OrderUpdate(
@@ -169,7 +169,7 @@ class KISAdapter(BrokerAdapter):
                 avg_fill_price=None,
                 fee=None,
                 ts=utc_now(),
-                meta={"error": str(e)},
+                raw={"error": str(e)},
             )
 
     async def get_equity(self) -> float:

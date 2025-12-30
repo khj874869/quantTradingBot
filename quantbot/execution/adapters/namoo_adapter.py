@@ -47,7 +47,7 @@ class NamooAdapter(BrokerAdapter):
                 avg_fill_price=(float(data["avg_fill_price"]) if data.get("avg_fill_price") is not None else None),
                 fee=(float(data["fee"]) if data.get("fee") is not None else None),
                 ts=utc_now(),
-                meta={"raw": data},
+                raw=data,
             )
         except Exception as e:
             return OrderUpdate(
@@ -60,7 +60,7 @@ class NamooAdapter(BrokerAdapter):
                 avg_fill_price=None,
                 fee=None,
                 ts=utc_now(),
-                meta={"error": str(e)},
+                raw={"error": str(e)},
             )
 
     async def get_last_price(self, symbol: str) -> float:

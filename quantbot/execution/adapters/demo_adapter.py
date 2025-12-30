@@ -1,8 +1,11 @@
 from __future__ import annotations
+
 import asyncio
+
 from quantbot.common.types import OrderRequest, OrderUpdate
 from quantbot.utils.time import utc_now
 from quantbot.execution.adapters.base import BrokerAdapter
+
 
 class DemoAdapter(BrokerAdapter):
     def __init__(self):
@@ -10,19 +13,42 @@ class DemoAdapter(BrokerAdapter):
         self._pos: dict[str, float] = {}
         self._prices: dict[str, float] = {}
 
-    def set_price(self, symbol: str, px: float):
+    def set_price(self, symbol: str, px: float) -> None:
         self._prices[symbol] = px
 
     async def place_order(self, req: OrderRequest) -> OrderUpdate:
         await asyncio.sleep(0.02)
-        px = req.price or self._prices.get(req.symbol, 0.0)
+        px = float(req.price or self._prices.get(req.symbol, 0.0))
         if px <= 0:
-            return OrderUpdate(req.venue, "DEMO-REJECT", req.client_order_id, req.symbol,
-                               "REJECTED", 0.0, None, 0.0, utc_now(), {"error":"no price"})
-        signed = req.qty if req.side == "BUY" else -req.qty
-        self._pos[req.symbol] = self._pos.get(req.symbol, 0.0) + signed
-        return OrderUpdate(req.venue, "DEMO-"+req.client_order_id[-10:], req.client_order_id, req.symbol,
-                           "FILLED", req.qty, float(px), 0.0, utc_now(), {"demo": True})
+            return OrderUpdate(
+                venue=req.venue,
+                order_id="DEMO-REJECT",
+                symbol=req.symbol,
+                status="REJECTED",
+                filled_qty=0.0,
+                avg_fill_price=None,
+                fee=0.0,
+                client_order_id=req.client_order_id,
+                ts=utc_now(),
+                raw={"error": "no price"},
+            )
+
+        signed = float(req.qty) if req.side.upper() == "BUY" else -float(req.qty)
+        self._pos[req.symbol] = float(self._pos.get(req.symbol, 0.0)) + signed
+
+        coid = req.client_order_id or "DEMO"
+        return OrderUpdate(
+            venue=req.venue,
+            order_id="DEMO-" + coid[-10:],
+            symbol=req.symbol,
+            status="FILLED",
+            filled_qty=float(req.qty),
+            avg_fill_price=px,
+            fee=0.0,
+            client_order_id=req.client_order_id,
+            ts=utc_now(),
+            raw={"demo": True},
+        )
 
     async def get_last_price(self, symbol: str) -> float:
         return float(self._prices.get(symbol, 0.0))

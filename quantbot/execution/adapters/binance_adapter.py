@@ -56,18 +56,23 @@ class BinanceAdapter(BrokerAdapter):
         symbol = self._norm_symbol(req.symbol)
         side = req.side.upper()
         order_type = (req.order_type or "MARKET").upper()
+        meta = req.meta or {}
 
         params: dict[str, Any] = {
             "symbol": symbol,
             "side": side,
             "type": order_type,
         }
+        if meta.get("newOrderRespType"):
+            params["newOrderRespType"] = str(meta["newOrderRespType"])
+        elif meta.get("timeInForce") in {"IOC", "FOK"}:
+            params["newOrderRespType"] = "RESULT"
 
         if order_type == "LIMIT":
             if req.price is None:
                 raise ValueError("LIMIT order requires req.price")
             params.update({
-                "timeInForce": "GTC",
+                "timeInForce": str(meta.get("timeInForce") or "GTC"),
                 "quantity": self._fmt_qty(req.qty),
                 "price": self._fmt_price(req.price),
             })
@@ -101,7 +106,7 @@ class BinanceAdapter(BrokerAdapter):
                 avg_fill_price=avg_price,
                 fee=None,
                 ts=utc_now(),
-                meta={"raw": data},
+                raw=data,
             )
         except Exception as e:
             return OrderUpdate(
@@ -114,7 +119,7 @@ class BinanceAdapter(BrokerAdapter):
                 avg_fill_price=None,
                 fee=None,
                 ts=utc_now(),
-                meta={"error": str(e)},
+                raw={"error": str(e)},
             )
 
     async def get_last_price(self, symbol: str) -> float:

@@ -1,0 +1,29 @@
+{
+  "python": "python",
+  "bots": [
+    {
+      "mode": "paper",
+      "venue": "binance_futures",
+      "strategy": "scalp",
+      "symbols": ["BTCUSDT"],
+      "preset": "binance_futures_btc_scalp",
+      "intended_notional": 100,
+      "account_tag": "binance_futures_main",
+      "global_risk_path": "state/global_risk.json",
+      "max_account_exposure_frac": 0.35,
+      "max_total_exposure_frac": 0.60
+    },
+    {
+      "mode": "paper",
+      "venue": "upbit",
+      "strategy": "scalp",
+      "symbols": ["KRW-BTC"],
+      "preset": "upbit_btc_scalp",
+      "intended_notional": 100000,
+      "account_tag": "upbit_main",
+      "global_risk_path": "state/global_risk.json",
+      "max_account_exposure_frac": 0.25,
+      "max_total_exposure_frac": 0.60
+    }
+  ]
+}

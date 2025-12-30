@@ -94,3 +94,19 @@ async def fetch_upbit_orderbook(market: str) -> Any:
         return r.json()
     finally:
         await client.aclose()
+
+
+
+async def fetch_upbit_recent_trades(market: str, count: int = 200) -> list[dict]:
+    """Public recent trades (ticks).
+
+    Upbit returns a list where `ask_bid` is "BID" for buy-side trades and "ASK" for sell-side trades.
+    """
+    client = httpx.AsyncClient(timeout=10)
+    try:
+        r = await client.get(BASE_URL + "/v1/trades/ticks", params={"market": market, "count": int(count)})
+        r.raise_for_status()
+        data = r.json()
+        return data if isinstance(data, list) else []
+    finally:
+        await client.aclose()

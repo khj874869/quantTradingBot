@@ -1,147 +1,156 @@
 from __future__ import annotations
 
-import time
-import hmac
 import hashlib
-from urllib.parse import urlencode
+import hmac
+import time
+from typing import Any, Dict, Optional
 
 import httpx
 
-from quantbot.execution.adapters.base import BrokerAdapter
 from quantbot.common.types import OrderRequest, OrderUpdate
-from quantbot.utils.time import utc_now
+from quantbot.execution.adapters.base import BrokerAdapter
 
 
 class BinanceFuturesAdapter(BrokerAdapter):
-    """
-    USD-M Futures (FAPI) adapter.
-    Testnet REST base: https://demo-fapi.binance.com  :contentReference[oaicite:3]{index=3}
+    """Binance USDⓈ-M futures (fapi) adapter.
+
+    - Orders: POST /fapi/v1/order
+    - Price: GET /fapi/v1/ticker/price
+    - Account equity: GET /fapi/v2/account
+
+    Note: You must set API key/secret with futures permission.
     """
 
-    def __init__(self, api_key: str, api_secret: str, base_url: str = "https://fapi.binance.com"):
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        base_url: str = "https://fapi.binance.com",
+        timeout: float = 10.0,
+    ):
         self.api_key = api_key
-        self.api_secret = api_secret.encode("utf-8")
+        self.api_secret = api_secret
         self.base_url = base_url.rstrip("/")
-        self.client = httpx.AsyncClient(timeout=10)
+        self.client = httpx.AsyncClient(timeout=timeout)
 
-    # ---------- helpers ----------
-    def _sign(self, params: dict) -> dict:
-        params = dict(params)
-        params["timestamp"] = int(time.time() * 1000)
-        qs = urlencode(params, doseq=True)
-        sig = hmac.new(self.api_secret, qs.encode("utf-8"), hashlib.sha256).hexdigest()
-        params["signature"] = sig
-        return params
+    def _ts(self) -> int:
+        return int(time.time() * 1000)
 
-    async def _signed(self, method: str, path: str, params: dict | None = None) -> dict:
-        params = params or {}
-        signed = self._sign(params)
+    def _sign(self, query: str) -> str:
+        return hmac.new(self.api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+
+    async def _signed_request(self, method: str, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        params = {k: v for k, v in params.items() if v is not None}
+        params.setdefault("timestamp", self._ts())
+        query = httpx.QueryParams(params).render()
+        sig = self._sign(query)
+        url = f"{self.base_url}{path}?{query}&signature={sig}"
         headers = {"X-MBX-APIKEY": self.api_key}
-        url = f"{self.base_url}{path}"
-        # Binance는 signed params를 querystring 또는 form으로 받을 수 있음(일반적으로 form 사용)
-        if method.upper() == "GET":
-            r = await self.client.request(method, url, params=signed, headers=headers)
-        else:
-            r = await self.client.request(method, url, data=signed, headers=headers)
+        r = await self.client.request(method, url, headers=headers)
         r.raise_for_status()
         return r.json()
 
-    async def _public(self, method: str, path: str, params: dict | None = None) -> dict:
+    async def _public_get(self, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
         url = f"{self.base_url}{path}"
-        r = await self.client.request(method, url, params=params or {})
+        r = await self.client.get(url, params=params)
         r.raise_for_status()
         return r.json()
 
-    # ---------- futures extra ----------
-    async def set_leverage(self, symbol: str, leverage: int) -> dict:
-        # POST /fapi/v1/leverage :contentReference[oaicite:4]{index=4}
-        return await self._signed("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage})
+    def _normalize_symbol(self, symbol: str) -> str:
+        return symbol.replace("/", "").replace("-", "").upper()
 
-    # ---------- BrokerAdapter ----------
     async def place_order(self, req: OrderRequest) -> OrderUpdate:
-        """
-        Futures new order: POST /fapi/v1/order :contentReference[oaicite:5]{index=5}
-        """
-        side = "BUY" if req.side == "BUY" else "SELL"
+        symbol = self._normalize_symbol(req.symbol)
+        side = req.side.upper()
+        order_type = req.order_type.upper()
 
-        payload: dict = {
-            "symbol": req.symbol,
+        params: Dict[str, Any] = {
+            "symbol": symbol,
             "side": side,
+            "type": order_type,
+            "quantity": req.qty,
             "newClientOrderId": req.client_order_id,
         }
 
-        if req.order_type == "MARKET":
-            payload["type"] = "MARKET"
-            payload["quantity"] = self._fmt_qty(req.qty)
-        else:
-            payload["type"] = "LIMIT"
-            payload["timeInForce"] = "GTC"
-            payload["quantity"] = self._fmt_qty(req.qty)
+        meta = req.meta or {}
+        # Futures-specific flags
+        if meta.get("reduceOnly") is not None:
+            params["reduceOnly"] = "true" if bool(meta.get("reduceOnly")) else "false"
+        if meta.get("positionSide") is not None:
+            params["positionSide"] = meta.get("positionSide")  # LONG/SHORT (hedge mode)
+
+        if order_type == "LIMIT":
             if req.price is None:
                 raise ValueError("LIMIT order requires price")
-            payload["price"] = self._fmt_price(req.price)
+            params["price"] = req.price
+            params["timeInForce"] = meta.get("timeInForce", "GTC")
 
-        try:
-            data = await self._signed("POST", "/fapi/v1/order", payload)
-            # 체결 즉시 응답이 아니어도 orderId 등은 내려옴
-            return OrderUpdate(
-                venue=req.venue,
-                order_id=str(data.get("orderId", "")),
-                client_order_id=req.client_order_id,
-                symbol=req.symbol,
-                status="NEW",
-                filled_qty=float(data.get("executedQty", 0.0) or 0.0),
-                avg_fill_price=float(data.get("avgPrice", 0.0) or 0.0) if "avgPrice" in data else None,
-                fee=None,
-                ts=utc_now(),
-                raw=data,
-            )
-        except httpx.HTTPStatusError as e:
-            return OrderUpdate(
-                venue=req.venue,
-                order_id="",
-                client_order_id=req.client_order_id,
-                symbol=req.symbol,
-                status="REJECTED",
-                filled_qty=0.0,
-                avg_fill_price=None,
-                fee=None,
-                ts=utc_now(),
-                raw={"error": str(e), "response": getattr(e.response, "text", "")},
-            )
+        # IOC uses taker fee; for speed you may want price protection via slippage bps.
+        data = await self._signed_request("POST", "/fapi/v1/order", params)
+
+        status = str(data.get("status") or "NEW")
+        executed_qty = float(data.get("executedQty") or 0.0)
+        avg_price = float(data.get("avgPrice") or 0.0)
+        fee = None
+
+        # Some responses include fills only in spot; futures usually doesn't.
+        if avg_price == 0.0 and executed_qty > 0 and data.get("cumQuote") is not None:
+            try:
+                cum_quote = float(data.get("cumQuote") or 0.0)
+                avg_price = cum_quote / executed_qty if executed_qty else 0.0
+            except Exception:
+                pass
+
+        mapped_status = {
+            "NEW": "NEW",
+            "PARTIALLY_FILLED": "PARTIALLY_FILLED",
+            "FILLED": "FILLED",
+            "CANCELED": "CANCELED",
+            "REJECTED": "REJECTED",
+            "EXPIRED": "CANCELED",
+        }.get(status, status)
+
+        return OrderUpdate(
+            venue=req.venue,
+            symbol=req.symbol,
+            order_id=str(data.get("orderId")),
+            client_order_id=req.client_order_id,
+            status=mapped_status,
+            filled_qty=executed_qty,
+            avg_fill_price=avg_price if avg_price > 0 else None,
+            fee=fee,
+            raw=data,
+        )
 
     async def get_last_price(self, symbol: str) -> float:
-        # GET /fapi/v1/ticker/price :contentReference[oaicite:6]{index=6}
-        data = await self._public("GET", "/fapi/v1/ticker/price", {"symbol": symbol})
+        symbol_n = self._normalize_symbol(symbol)
+        data = await self._public_get("/fapi/v1/ticker/price", {"symbol": symbol_n})
         return float(data["price"])
 
     async def get_equity(self) -> float:
-        # GET /fapi/v2/balance :contentReference[oaicite:7]{index=7}
-        data = await self._signed("GET", "/fapi/v2/balance", {})
-        # USDT margin 기준으로 “총 잔고(balance)” 합산(단순)
-        total = 0.0
-        for a in data:
-            if a.get("asset") == "USDT":
-                total = float(a.get("balance", 0.0) or 0.0)
-                break
-        return total
+        data = await self._signed_request("GET", "/fapi/v2/account", {})
+        # totalWalletBalance is in USDT for USDT-margined futures; use it as equity proxy.
+        try:
+            return float(data.get("totalWalletBalance") or 0.0)
+        except Exception:
+            return 0.0
 
-    async def get_positions(self) -> dict[str, float]:
-        # GET /fapi/v2/positionRisk :contentReference[oaicite:8]{index=8}
-        data = await self._signed("GET", "/fapi/v2/positionRisk", {})
-        out: dict[str, float] = {}
-        for p in data:
-            sym = p.get("symbol")
-            amt = float(p.get("positionAmt", 0.0) or 0.0)
-            if sym:
-                out[sym] = amt
+    async def get_positions(self) -> Dict[str, float]:
+        data = await self._signed_request("GET", "/fapi/v2/account", {})
+        out: Dict[str, float] = {}
+        for p in data.get("positions", []) or []:
+            try:
+                sym = str(p.get("symbol"))
+                amt = float(p.get("positionAmt") or 0.0)
+                if amt != 0.0:
+                    out[sym] = amt
+            except Exception:
+                continue
         return out
 
-    @staticmethod
-    def _fmt_qty(q: float) -> str:
-        # 심볼별 stepSize는 exchangeInfo로 맞추는 게 정석이지만, 일단 소수 6자리로
-        return f"{float(q):.6f}".rstrip("0").rstrip(".")
+    async def set_leverage(self, symbol: str, leverage: int) -> None:
+        symbol_n = self._normalize_symbol(symbol)
+        await self._signed_request("POST", "/fapi/v1/leverage", {"symbol": symbol_n, "leverage": int(leverage)})
 
-    @staticmethod
-    def _fmt_price(p: float) -> str:
-        return f"{float(p):.2f}".rstrip("0").rstrip(".")
+    async def close(self) -> None:
+        await self.client.aclose()

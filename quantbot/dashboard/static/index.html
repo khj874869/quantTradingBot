@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>QuantBot Dashboard</title>
+  <style>
+    body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto; background:#0b0e11; color:#eaecef; }
+    .grid { display:grid; grid-template-columns: 340px 1fr; gap: 12px; height: 100vh; padding: 12px; box-sizing:border-box; }
+    .panel { background:#11161c; border:1px solid #1e2329; border-radius: 12px; padding: 12px; overflow: auto; }
+    h2 { font-size: 14px; margin: 0 0 10px 0; opacity: 0.9; }
+    .bot { padding: 10px; border:1px solid #1e2329; border-radius: 10px; margin-bottom:10px; cursor:pointer; }
+    .bot.active { border-color:#f0b90b; }
+    .kvs { display:grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .kv { background:#0b0e11; border:1px solid #1e2329; border-radius: 10px; padding: 8px; }
+    .kv .k { font-size: 11px; opacity:0.7; }
+    .kv .v { font-size: 14px; margin-top: 2px; }
+    .muted { opacity:0.7 }
+    .main { display:grid; grid-template-columns: 1.7fr 1fr; gap: 12px; }
+    #chart { height: 520px; }
+    .tabs { display:flex; gap: 8px; flex-wrap: wrap; }
+    .tabbtn { background:#0b0e11; border:1px solid #1e2329; border-radius: 10px; padding: 6px 10px; font-size:12px; color:#eaecef; cursor:pointer; opacity:0.9; }
+    .tabbtn.active { border-color:#f0b90b; }
+    .tab { display:none; }
+    .tab.active { display:block; }
+    table { width:100%; border-collapse: collapse; font-size:12px; }
+    th, td { border-bottom: 1px solid #1e2329; padding: 6px; text-align:left; }
+    .buy { color: #00c087; }
+    .sell { color: #f6465d; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    .rightcol { display:flex; flex-direction: column; gap: 12px; }
+    .small { font-size:11px; }
+    .split { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .miniChart { height: 140px; }
+    .hint { font-size:11px; opacity:0.7; margin-top:6px; }
+    .depthcell { position:relative; }
+    .depthbar { position:absolute; left:0; top:0; bottom:0; width:0%; opacity:0.12; }
+    .depthbar.buy { background:#00c087; }
+    .depthbar.sell { background:#f6465d; }
+    .depthtext { position:relative; z-index:1; }
+    .sectionTitle { font-size:12px; margin: 6px 0 8px 0; opacity:0.8; }
+  </style>
+  <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+  <div class="grid">
+    <div class="panel">
+      <h2>Bots</h2>
+      <div id="bots"></div>
+      <div style="height:10px"></div>
+      <h2>Monthly / Last 30d PnL</h2>
+      <div class="kvs">
+        <div class="kv"><div class="k">Realized (net)</div><div class="v" id="m_realized">-</div></div>
+        <div class="kv"><div class="k">Fees</div><div class="v" id="m_fees">-</div></div>
+        <div class="kv"><div class="k">Return % (30d)</div><div class="v" id="m_ret30">-</div></div>
+      </div>
+      <p class="muted small" style="margin-top:8px">(computed from state/fills.jsonl)</p>
+    </div>
+
+    <div class="rightcol">
+      <div class="panel">
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:12px;">
+          <h2 id="title" style="margin:0">Market</h2>
+          <div class="tabs">
+            <button class="tabbtn active" data-tab="tab_orderbook">Orderbook</button>
+            <button class="tabbtn" data-tab="tab_positions">Positions</button>
+            <button class="tabbtn" data-tab="tab_orders">Orders</button>
+            <button class="tabbtn" data-tab="tab_trades">Trades</button>
+            <button class="tabbtn" data-tab="tab_flow">Flow</button>
+            <button class="tabbtn" data-tab="tab_liq">Liq</button>
+            <button class="tabbtn" data-tab="tab_signal">Signal</button>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h3>Performance (30d)</h3>
+          <div id="equityChart" class="miniChart"></div>
+          <div style="height: 12px"></div>
+          <div id="dailyPnlChart" class="miniChart"></div>
+          <div class="hint">Equity curve and daily realized PnL (net).</div>
+        </div>
+
+        <div class="main" style="margin-top:12px">
+          <div>
+            <div id="chart"></div>
+            <div class="split" style="margin-top:12px">
+              <div class="panel" style="margin:0">
+                <h2>Position</h2>
+                <div class="kvs">
+                  <div class="kv"><div class="k">Qty</div><div class="v mono" id="p_qty">-</div></div>
+                  <div class="kv"><div class="k">Avg</div><div class="v mono" id="p_avg">-</div></div>
+                  <div class="kv"><div class="k">Unrealized</div><div class="v mono" id="p_unr">-</div></div>
+                  <div class="kv"><div class="k">Realized (net)</div><div class="v mono" id="p_real">-</div></div>
+                  <div class="kv"><div class="k">Equity</div><div class="v mono" id="p_eq">-</div></div>
+                  <div class="kv"><div class="k">PnL %</div><div class="v mono" id="p_pnlpct">-</div></div>
+                </div>
+              </div>
+              <div class="panel" style="margin:0">
+                <h2>Market</h2>
+                <div class="kvs">
+                  <div class="kv"><div class="k">Last</div><div class="v mono" id="m_last">-</div></div>
+                  <div class="kv"><div class="k">Bid / Ask</div><div class="v mono" id="m_ba">-</div></div>
+                  <div class="kv"><div class="k">Mode</div><div class="v mono" id="m_mode">-</div></div>
+                  <div class="kv"><div class="k">Strategy</div><div class="v mono" id="m_strat">-</div></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div>
+            <div id="tab_orderbook" class="tab active">
+              <h2>Orderbook (Top 10)</h2>
+              <div id="ob"></div>
+            </div>
+            <div id="tab_trades" class="tab">
+              <h2>Recent Trades</h2>
+              <div id="trades"></div>
+            </div>
+            <div id="tab_orders" class="tab">
+              <h2>Orders / Fills</h2>
+              <div class="hint">Recent fills (state/fills.jsonl). Filtered by account_tag & symbol.</div>
+              <div id="orders"></div>
+            </div>
+            <div id="tab_positions" class="tab">
+              <h2>Positions / Risk</h2>
+              <div class="hint">Multi-bot exposure snapshot from state/global_risk.json</div>
+              <div id="positions"></div>
+            </div>
+            <div id="tab_flow" class="tab">
+              <h2>Flow</h2>
+              <div id="flow"></div>
+            </div>
+            <div id="tab_liq" class="tab">
+              <h2>Liquidations</h2>
+              <div id="liq"></div>
+            </div>
+            <div id="tab_signal" class="tab">
+              <h2>Last Signal</h2>
+              <div id="signal"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:12px;">
+          <h2 style="margin:0">Events / Debug</h2>
+          <div class="tabs">
+            <button class="tabbtn active" data-tab="tab_events">Events</button>
+            <button class="tabbtn" data-tab="tab_raw">Raw State</button>
+          </div>
+        </div>
+        <div style="margin-top:12px">
+          <div id="tab_events" class="tab active">
+            <div id="events"></div>
+          </div>
+          <div id="tab_raw" class="tab">
+            <pre id="raw" class="muted small" style="white-space:pre-wrap;"></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
