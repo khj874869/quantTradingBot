@@ -1,0 +1,19 @@
+# systemd unit template (옵션)
+# 파일명 예: /etc/systemd/system/quantbot-multirunner.service
+
+[Unit]
+Description=QuantBot MultiRunner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/quantbot_complete_final
+ExecStart=/usr/bin/python3 -m quantbot.multi_runner /opt/quantbot_complete_final/example_multi_run.json
+Restart=always
+RestartSec=3
+# .env는 WorkingDirectory 기준으로 자동 로드됨(quantbot/config.py)
+# Environment="TRADING_ENABLED=false"
+
+[Install]
+WantedBy=multi-user.target
