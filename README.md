@@ -64,7 +64,10 @@ python -m quantbot.main --mode paper --venue upbit   --strategy blender   --symb
 ```bash
 python -m quantbot.main --mode paper --venue upbit   --strategy scalp   --symbols KRW-BTC   --entry-tf 1m --poll-sec 5   --take-profit-net-pct 0.0039 --leverage 10   --scalp-min-1m-trade-value 50000000   --scalp-min-orderbook-notional 100000000   --paper-cash 1000000 --paper-fee-bps 10 --paper-slippage-bps 5
 ```
-
+### binance(paper scalp)
+```bash
+py -m quantbot.main --mode paper --venue binance   --strategy scalp   --symbols BTC   --entry-tf 1m --poll-sec 5   --take-profit-net-pct 0.0039 --leverage 10   --scalp-min-1m-trade-value 50000000   --scalp-min-orderbook-notional 100000000   --paper-cash 1000000 --paper-fee-bps 10 --paper-slippage-bps 5
+```
 ## Live usage examples
 
 ### Upbit
@@ -163,3 +166,11 @@ quantbot --mode paper --venue upbit --strategy scalp --symbols KRW-BTC \
 Notes:
 - `--scalp-use-ws-trades 1` uses real-time trade stream to compute pressure; if no ticks arrive for `--scalp-ws-staleness-sec`, it falls back to REST.
 - Spread/volatility/news-candle filters are optional; set them to 0 to disable.
+
+
+## 4) 투자 전략 실행 json 
+# v1 공격형
+python -m quantbot.multi_runner multi_run_binance_demo_v1_aggressive.json
+
+# v2 보수형
+python -m quantbot.multi_runner multi_run_binance_demo_v2_conservative.json

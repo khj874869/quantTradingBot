@@ -1,0 +1,37 @@
+{
+  "python": ".venv\\Scripts\\python.exe",
+  "bots": [
+    {
+      "mode": "live",
+      "venue": "binance_futures",
+      "strategy": "scalp",
+      "symbols": ["BTCUSDT"],
+      "preset": "binance_futures_btc_scalp",
+
+      "intended_notional": 50,
+      "account_tag": "binance_demo",
+
+      "take_profit_net_pct": 0.0039,
+      "stop_loss_pct": 0.0022,
+      "trailing_stop_pct": 0.0012,
+
+      "scalp_flow_window_sec": 5,
+      "scalp_min_trade_count": 32,
+      "scalp_large_trade_min_notional": 30000,
+      "scalp_min_large_trade_share": 0.14,
+      "scalp_min_flow_notional_rate": 360000,
+      "scalp_min_flow_accel": 80000,
+      "scalp_min_ob_imb_delta": 0.05,
+
+      "ioc_price_pad_bps": 2.5,
+      "ioc_max_chase_bps": 14.0,
+
+      "scalp_max_spread_bps": 5.0,
+      "scalp_max_1m_range_pct": 0.010,
+      "scalp_max_1m_body_pct": 0.007,
+
+      "max_account_exposure_frac": 0.18,
+      "max_total_exposure_frac": 0.30
+    }
+  ]
+}
