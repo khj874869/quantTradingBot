@@ -179,12 +179,12 @@ def main():
 
     # additional scalp filters
     parser.add_argument("--scalp-max-spread-bps", type=float, default=None, help="skip entry if spread > this bps (default=8)")
-    parser.add_argument("--scalp-max-1m-range-pct", type=float, default=None, help="skip entry if last 1m range (high-low)/close > this (e.g. 0.012=1.2%)")
+    parser.add_argument("--scalp-max-1m-range-pct", type=float, default=None,help="skip entry if last 1m range (high-low)/close > this (e.g. 0.012 = 1.2 percent)")
     parser.add_argument("--scalp-max-1m-body-pct", type=float, default=None, help="skip entry if last 1m body abs(close-open)/open > this")
 
     # news candle lockout
     parser.add_argument("--scalp-news-spike-tv-mult", type=float, default=None, help="trade-value spike multiplier vs SMA20 (default=5)")
-    parser.add_argument("--scalp-news-spike-move-pct", type=float, default=None, help="price move threshold for spike (default=0.007=0.7%)")
+    parser.add_argument("--scalp-news-spike-move-pct", type=float, default=None, help="price move threshold for spike (default=0.007=0.7 percent)")
     parser.add_argument("--scalp-news-cooldown-sec", type=int, default=None, help="cooldown seconds after spike (default=300)")
 
     args = parser.parse_args()

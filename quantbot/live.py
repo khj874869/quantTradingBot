@@ -4,6 +4,7 @@ import asyncio
 import json
 import math
 import time
+import inspect
 from collections import deque
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -96,7 +97,7 @@ class SimpleMinuteBarBuilder:
         df = df.set_index("ts")
         return df.tail(int(limit))
 
-
+   
 
 @dataclass
 class LiveConfig:
@@ -303,20 +304,75 @@ def _venue_supports_ioc(venue: str) -> bool:
     return venue in {"binance", "binance_futures", "paper", "kiwoom", "namoo_stock"}
 
 
+async def _call(fn, *args, **kwargs):
+    """
+    Call a function that might be async or sync.
+    - If async: await it.
+    - If sync: run in asyncio.to_thread to avoid blocking the event loop.
+    """
+    if inspect.iscoroutinefunction(fn):
+        return await fn(*args, **kwargs)
+    return await asyncio.to_thread(fn, *args, **kwargs)
+
+
 async def _fetch_1m_candles(venue: str, symbol: str, limit: int = 400):
+    # Upbit candles (REST)
     if venue == "upbit":
-        return await fetch_upbit_candles(symbol, minutes=1, count=min(limit, 200))
-    if venue in {"binance", "binance_futures"}:
-        return await fetch_binance_klines(symbol, interval="1m", limit=limit, futures=(venue == "binance_futures"))
-    # For stocks/others, rely on DB ingest pipeline.
-    return load_candles_df(venue, symbol, "1m", limit=limit)
+        return await _call(fetch_upbit_candles, symbol, minutes=1, count=min(int(limit), 200))
+
+    # Binance spot / futures candles (REST)
+    if venue in ("binance", "binance_futures"):
+        base = {"symbol": symbol, "interval": "1m"}
+        limit_keys = ("limit", "count", "n", "size", "max_records", "maxRows")
+        flags = ("futures", "is_futures", "futures_mode") if venue == "binance_futures" else (None,)
+        for lk in limit_keys:
+            for fk in flags:
+                kw = dict(base)
+                kw[lk] = int(limit)
+                try:
+                    if fk:
+                        return await _call(fetch_binance_klines, **kw, **{fk: True})
+                    return await _call(fetch_binance_klines, **kw)
+                except TypeError as e:
+                    msg = str(e)
+                    if "unexpected keyword argument" in msg and (f"\'{lk}\'" in msg or (fk and f"\'{fk}\'" in msg)):
+                        continue
+                    raise
+        # Fallback: try without limit kw (collector might have a default)
+        for fk in flags:
+            try:
+                if fk:
+                    return await _call(fetch_binance_klines, symbol=symbol, interval="1m", **{fk: True})
+                return await _call(fetch_binance_klines, symbol=symbol, interval="1m")
+            except TypeError as e:
+                msg = str(e)
+                if "unexpected keyword argument" in msg and fk and f"\'{fk}\'" in msg:
+                    continue
+                # maybe expects positional args
+                try:
+                    return await _call(fetch_binance_klines, symbol, "1m", int(limit))
+                except TypeError:
+                    return await _call(fetch_binance_klines, symbol, "1m")
+
+    # Other venues: candles are built elsewhere (e.g., SimpleMinuteBarBuilder for stocks)
+    return None
 
 
 async def _fetch_orderbook(venue: str, symbol: str, adapter: Optional[Any] = None) -> Optional[dict]:
     if venue == "upbit":
-        return await fetch_upbit_orderbook(symbol)
+        return await _call(fetch_upbit_orderbook, symbol)
+
     if venue in {"binance", "binance_futures"}:
-        return await fetch_binance_orderbook(symbol, futures=(venue == "binance_futures"))
+        if venue == "binance_futures":
+            for flag in ("futures", "is_futures", "futures_mode"):
+                try:
+                    return await _call(fetch_binance_orderbook, symbol, **{flag: True})
+                except TypeError as e:
+                    if f"unexpected keyword argument '{flag}'" in str(e):
+                        continue
+                    raise
+            return await _call(fetch_binance_orderbook, symbol)
+        return await _call(fetch_binance_orderbook, symbol)
 
     # Stocks/others: try adapter-provided orderbook if available.
     if adapter is not None and hasattr(adapter, "get_orderbook"):
@@ -325,7 +381,6 @@ async def _fetch_orderbook(venue: str, symbol: str, adapter: Optional[Any] = Non
         except Exception:
             return None
     return None
-
 
 
 def _write_bot_state(cfg: LiveConfig, symbol: str, payload: Dict[str, Any]) -> None:
@@ -529,7 +584,8 @@ async def run_live(cfg: LiveConfig) -> None:
 
     pressure = TradePressureBook(window_sec=cfg.scalp_pressure_window_sec)
     flow = TradeFlowBook(window_sec=cfg.scalp_flow_window_sec, large_trade_min_notional=cfg.scalp_large_trade_min_notional)
-    ob_delta = OrderbookDeltaBook(depth=cfg.scalp_ob_delta_depth)
+    ob_delta = OrderbookDeltaBook()
+    #depth=cfg.scalp_ob_delta_depth
     liq_cluster = LiquidationClusterBook(window_sec=cfg.scalp_liq_window_sec, bucket_bps=cfg.scalp_liq_bucket_bps)
 
     # Background streams (non-blocking)
