@@ -32,9 +32,10 @@ from quantbot.risk.position_tracker import PositionTracker
 from quantbot.risk.exits import ExitManager, ExitConfig
 from quantbot.risk.risk_manager import RiskManager, PortfolioState
 from quantbot.risk.global_exposure import GlobalExposureStore
+from quantbot.risk.cooldown import CooldownManager
 from quantbot.execution.executor import OrderExecutor
 from quantbot.common.types import OrderRequest, Signal, ExecutionResult
-from quantbot.journal import append_event, append_equity_snapshot
+from quantbot.journal import append_event, append_equity_snapshot, append_sizing_snapshot
 
 from quantbot.execution.adapters.paper_adapter import PaperAdapter, PaperConfig
 from quantbot.execution.adapters.upbit_adapter import UpbitAdapter
@@ -168,6 +169,38 @@ class LiveConfig:
     scalp_news_spike_move_pct: float = settings.SCALP_NEWS_SPIKE_MOVE_PCT
     scalp_news_cooldown_sec: int = settings.SCALP_NEWS_COOLDOWN_SEC
 
+    # cooldowns (entry only)
+    scalp_cooldown_enabled: bool = settings.SCALP_COOLDOWN_ENABLED
+    scalp_cooldown_after_exit_fill_sec: int = settings.SCALP_COOLDOWN_AFTER_EXIT_FILL_SEC
+    scalp_cooldown_after_entry_fill_sec: int = settings.SCALP_COOLDOWN_AFTER_ENTRY_FILL_SEC
+    scalp_cooldown_reject_base_sec: int = settings.SCALP_COOLDOWN_REJECT_BASE_SEC
+    scalp_cooldown_http400_sec: int = settings.SCALP_COOLDOWN_HTTP400_SEC
+    scalp_cooldown_http401_sec: int = settings.SCALP_COOLDOWN_HTTP401_SEC
+    scalp_cooldown_rate_limit_sec: int = settings.SCALP_COOLDOWN_RATE_LIMIT_SEC
+    scalp_cooldown_insufficient_margin_sec: int = settings.SCALP_COOLDOWN_INSUFFICIENT_MARGIN_SEC
+    scalp_cooldown_min_notional_sec: int = settings.SCALP_COOLDOWN_MIN_NOTIONAL_SEC
+    scalp_cooldown_filter_fail_sec: int = settings.SCALP_COOLDOWN_FILTER_FAIL_SEC
+    scalp_cooldown_precision_sec: int = settings.SCALP_COOLDOWN_PRECISION_SEC
+    scalp_cooldown_position_side_sec: int = settings.SCALP_COOLDOWN_POSITION_SIDE_SEC
+    scalp_cooldown_reduce_only_sec: int = settings.SCALP_COOLDOWN_REDUCE_ONLY_SEC
+    scalp_cooldown_trigger_immediate_sec: int = settings.SCALP_COOLDOWN_TRIGGER_IMMEDIATE_SEC
+    scalp_cooldown_timestamp_sec: int = settings.SCALP_COOLDOWN_TIMESTAMP_SEC
+    scalp_cooldown_max_open_orders_sec: int = settings.SCALP_COOLDOWN_MAX_OPEN_ORDERS_SEC
+    scalp_cooldown_liquidation_sec: int = settings.SCALP_COOLDOWN_LIQUIDATION_SEC
+    scalp_cooldown_backoff_mult: float = settings.SCALP_COOLDOWN_BACKOFF_MULT
+    scalp_cooldown_max_sec: int = settings.SCALP_COOLDOWN_MAX_SEC
+    scalp_cooldown_fail_window_sec: int = settings.SCALP_COOLDOWN_FAIL_WINDOW_SEC
+
+    # auto remediation (entry only, best-effort)
+    scalp_auto_remediate_enabled: bool = settings.SCALP_AUTO_REMEDIATE_ENABLED
+    scalp_auto_remediate_max_retries: int = settings.SCALP_AUTO_REMEDIATE_MAX_RETRIES
+    scalp_auto_remediate_margin_shrink: float = settings.SCALP_AUTO_REMEDIATE_MARGIN_SHRINK
+    scalp_auto_remediate_cancel_own_open_orders: bool = settings.SCALP_AUTO_REMEDIATE_CANCEL_OWN_OPEN_ORDERS
+    scalp_auto_remediate_cancel_age_sec: int = settings.SCALP_AUTO_REMEDIATE_CANCEL_AGE_SEC
+    scalp_auto_remediate_disable_on_unauthorized_sec: int = settings.SCALP_AUTO_REMEDIATE_DISABLE_ON_UNAUTHORIZED_SEC
+    scalp_auto_remediate_disable_on_liquidation_sec: int = settings.SCALP_AUTO_REMEDIATE_DISABLE_ON_LIQUIDATION_SEC
+    scalp_auto_remediate_disable_on_position_side_sec: int = settings.SCALP_AUTO_REMEDIATE_DISABLE_ON_POSITION_SIDE_SEC
+
     # orderbook delta refinement
     scalp_ob_delta_depth: int = settings.SCALP_OB_DELTA_DEPTH
     scalp_min_ob_imb_delta: float = settings.SCALP_MIN_OB_IMB_DELTA
@@ -258,85 +291,387 @@ async def _adjust_qty_by_rules(
     Uses adapter.get_symbol_rules when available (Binance futures) to:
       - floor to stepSize
       - enforce minQty
-      - enforce minNotional (skip or bump)
+      - enforce minNotional (skip / bump / auto)
+
+    Additionally writes a sizing decision tape to state/sizing_history.jsonl.
     """
-    qty = float(qty or 0.0)
-    if qty <= 0 or last_price <= 0:
-        return 0.0, 0.0, "BAD_QTY_OR_PRICE"
+    qty_in = float(qty or 0.0)
+    px = float(last_price or 0.0)
+    eq = float(equity or 0.0)
+    intended_notional = float(intended_notional or 0.0)
+    order_type_u = str(order_type).upper()
+
+    lev = float(getattr(cfg, "leverage", 1.0) or 1.0)
+    lev = max(1e-9, lev)
+
+    snap_base: dict[str, Any] = {
+        "venue": str(venue),
+        "symbol": str(symbol),
+        "order_type": order_type_u,
+        "equity": eq,
+        "last_price": px,
+        "qty_in": qty_in,
+        "intended_notional": intended_notional,
+        "leverage": lev,
+        "order_sizing_mode": str(getattr(cfg, "order_sizing_mode", "fixed") or "fixed"),
+        "trade_equity_frac": float(getattr(cfg, "trade_equity_frac", 0.0) or 0.0),
+        "min_notional_policy": str(getattr(cfg, "min_notional_policy", "skip") or "skip"),
+        "min_notional_buffer": float(getattr(cfg, "min_notional_buffer", 1.0) or 1.0),
+        "auto_bump_max_over_margin_frac": float(getattr(cfg, "auto_bump_max_over_margin_frac", 0.5) or 0.5),
+        "auto_bump_max_equity_frac": float(getattr(cfg, "auto_bump_max_equity_frac", 0.30) or 0.30),
+    }
+
+    def commit(decision: str, qty_out: float, notional_out: float, reason: str | None = None, extra: dict[str, Any] | None = None):
+        payload = dict(snap_base)
+        payload.update({
+            "decision": decision,
+            "qty_out": float(qty_out or 0.0),
+            "notional_out": float(notional_out or 0.0),
+            "skip_reason": reason,
+        })
+        if extra:
+            payload.update(extra)
+        try:
+            append_sizing_snapshot(payload)
+        except Exception:
+            pass
+        return float(qty_out or 0.0), float(notional_out or 0.0), reason
+
+    if qty_in <= 0.0 or px <= 0.0:
+        return commit("SKIP", 0.0, 0.0, "BAD_QTY_OR_PRICE")
 
     # Default: no rules
     rules = None
     if hasattr(adapter, "get_symbol_rules"):
         try:
-            rules = await adapter.get_symbol_rules(symbol, order_type=str(order_type).upper())
-        except Exception:
+            rules = await adapter.get_symbol_rules(symbol, order_type=order_type_u)
+        except Exception as e:
             rules = None
+            snap_base["rules_error"] = str(e)
 
-    qty_adj = qty
-    if rules is not None and getattr(rules, "qty_step", 0.0):
-        step = float(getattr(rules, "qty_step", 0.0) or 0.0)
-        if step > 0:
-            qty_adj = math.floor(qty_adj / step) * step
+    step = float(getattr(rules, "qty_step", 0.0) or 0.0) if rules is not None else 0.0
+    min_qty = float(getattr(rules, "min_qty", 0.0) or 0.0) if rules is not None else 0.0
+    max_qty = float(getattr(rules, "max_qty", 0.0) or 0.0) if rules is not None else 0.0
+    min_notional = float(getattr(rules, "min_notional", 0.0) or 0.0) if rules is not None else 0.0
 
     if rules is not None:
-        min_qty = float(getattr(rules, "min_qty", 0.0) or 0.0)
-        if min_qty > 0 and qty_adj < min_qty:
-            qty_adj = min_qty
+        snap_base["rules"] = {
+            "qty_step": step,
+            "min_qty": min_qty,
+            "max_qty": max_qty,
+            "min_notional": min_notional,
+            "qty_precision": getattr(rules, "qty_precision", None),
+        }
 
-    notional_adj = qty_adj * last_price
+    # Apply step/minQty
+    qty_adj = qty_in
+    qty_after_step = qty_adj
+    if step > 0:
+        qty_after_step = math.floor(qty_adj / step) * step
+        qty_adj = qty_after_step
 
-    # Enforce min notional if known
-    if rules is not None and getattr(rules, "min_notional", None):
-        min_notional = float(getattr(rules, "min_notional") or 0.0)
-        if min_notional > 0 and notional_adj < min_notional:
-            policy = str(getattr(cfg, "min_notional_policy", "skip") or "skip").lower()
-            if policy in ("bump", "auto"):
-                buf = float(getattr(cfg, "min_notional_buffer", 1.0) or 1.0)
-                target = min_notional * max(1.0, buf)
-                if policy == "auto":
-                    # AUTO decision: bump only if doing so stays within risk-safe margin caps.
-                    # - Cap A: required margin <= intended_margin * (1 + auto_bump_max_over_margin_frac)
-                    # - Cap B: required margin <= equity * auto_bump_max_equity_frac
-                    lev = float(getattr(cfg, "leverage", 1.0) or 1.0)
-                    lev = max(1e-9, lev)
-                    intended_margin = float(intended_notional) / lev
-                    req_margin = target / lev
-                    max_over_margin = float(getattr(cfg, "auto_bump_max_over_margin_frac", 0.5) or 0.5)
-                    max_equity_frac = float(getattr(cfg, "auto_bump_max_equity_frac", 0.30) or 0.30)
-                    cap_margin = intended_margin * (1.0 + max(0.0, max_over_margin))
-                    cap_equity = (float(equity) * max(0.0, max_equity_frac)) if max_equity_frac > 0 else float("inf")
-                    if intended_margin <= 0:
-                        return 0.0, 0.0, f"MIN_NOTIONAL<{min_notional:g}_AUTO_SKIP(no_margin_budget)"
-                    if req_margin > cap_margin or req_margin > cap_equity:
-                        return 0.0, 0.0, (
+    qty_after_min_qty = qty_adj
+    if min_qty > 0 and qty_adj < min_qty:
+        qty_after_min_qty = min_qty
+        qty_adj = qty_after_min_qty
+
+    notional_adj = qty_adj * px
+
+    bumped = False
+    bump_target = None
+    bump_req_margin = None
+    bump_cap_margin = None
+    bump_cap_equity = None
+
+    # Enforce min notional
+    if min_notional > 0 and notional_adj < min_notional:
+        policy = str(getattr(cfg, "min_notional_policy", "skip") or "skip").lower()
+        if policy in ("bump", "auto"):
+            buf = float(getattr(cfg, "min_notional_buffer", 1.0) or 1.0)
+            bump_target = float(min_notional) * max(1.0, float(buf))
+
+            if policy == "auto":
+                intended_margin = float(intended_notional) / lev
+                bump_req_margin = float(bump_target) / lev
+                max_over_margin = float(getattr(cfg, "auto_bump_max_over_margin_frac", 0.5) or 0.5)
+                max_equity_frac = float(getattr(cfg, "auto_bump_max_equity_frac", 0.30) or 0.30)
+                bump_cap_margin = intended_margin * (1.0 + max(0.0, max_over_margin))
+                bump_cap_equity = (eq * max(0.0, max_equity_frac)) if max_equity_frac > 0 else float("inf")
+
+                if intended_margin <= 0:
+                    return commit(
+                        "SKIP",
+                        0.0,
+                        0.0,
+                        f"MIN_NOTIONAL<{min_notional:g}_AUTO_SKIP(no_margin_budget)",
+                        {
+                            "qty_after_step": qty_after_step,
+                            "qty_after_min_qty": qty_after_min_qty,
+                            "notional_before_min_notional": float(notional_adj),
+                            "target_notional": bump_target,
+                            "req_margin": bump_req_margin,
+                            "cap_margin": bump_cap_margin,
+                            "cap_equity": bump_cap_equity,
+                        },
+                    )
+
+                if bump_req_margin > bump_cap_margin or bump_req_margin > bump_cap_equity:
+                    return commit(
+                        "SKIP",
+                        0.0,
+                        0.0,
+                        (
                             f"MIN_NOTIONAL<{min_notional:g}_AUTO_SKIP("
-                            f"req_margin={req_margin:.4g} cap_margin={cap_margin:.4g} cap_equity={cap_equity:.4g}"
-                            f")"
-                        )
-                step = float(getattr(rules, "qty_step", 0.0) or 0.0)
-                qty_needed = target / max(1e-12, last_price)
-                if step > 0:
-                    qty_adj = math.ceil(qty_needed / step) * step
-                else:
-                    qty_adj = qty_needed
-                # enforce min qty again
-                min_qty = float(getattr(rules, "min_qty", 0.0) or 0.0)
-                if min_qty > 0 and qty_adj < min_qty:
-                    qty_adj = min_qty
-                notional_adj = qty_adj * last_price
-                console.print(f"[dim]MIN_NOTIONAL bump qty -> {qty_adj:g} (target_notional≈{target:g}, policy={policy})[/dim]")
-            else:
-                return 0.0, 0.0, f"MIN_NOTIONAL<{min_notional:g}"
+                            f"req_margin={bump_req_margin:.4g} cap_margin={bump_cap_margin:.4g} cap_equity={bump_cap_equity:.4g})"
+                        ),
+                        {
+                            "qty_after_step": qty_after_step,
+                            "qty_after_min_qty": qty_after_min_qty,
+                            "notional_before_min_notional": float(notional_adj),
+                            "target_notional": bump_target,
+                            "req_margin": bump_req_margin,
+                            "cap_margin": bump_cap_margin,
+                            "cap_equity": bump_cap_equity,
+                        },
+                    )
 
-    if rules is not None:
-        max_qty = float(getattr(rules, "max_qty", 0.0) or 0.0)
-        if max_qty > 0 and qty_adj > max_qty:
-            return 0.0, 0.0, "QTY_ABOVE_MAX"
+            qty_needed = float(bump_target) / max(1e-12, px)
+            if step > 0:
+                qty_adj = math.ceil(qty_needed / step) * step
+            else:
+                qty_adj = qty_needed
+            if min_qty > 0 and qty_adj < min_qty:
+                qty_adj = min_qty
+
+            notional_adj = qty_adj * px
+            bumped = True
+
+            console.print(
+                f"[dim]SIZING[/dim] {symbol} minNotional bump -> qty={qty_adj:g} notional≈{notional_adj:.4g} target≈{bump_target:.4g} policy={policy}"
+            )
+        else:
+            return commit(
+                "SKIP",
+                0.0,
+                0.0,
+                f"MIN_NOTIONAL<{min_notional:g}",
+                {
+                    "qty_after_step": qty_after_step,
+                    "qty_after_min_qty": qty_after_min_qty,
+                    "notional_before_min_notional": float(notional_adj),
+                    "min_notional": float(min_notional),
+                },
+            )
+
+    if max_qty > 0 and qty_adj > max_qty:
+        return commit(
+            "SKIP",
+            0.0,
+            0.0,
+            "QTY_ABOVE_MAX",
+            {
+                "qty_after_step": qty_after_step,
+                "qty_after_min_qty": qty_after_min_qty,
+                "qty_final": float(qty_adj),
+                "max_qty": float(max_qty),
+            },
+        )
 
     if qty_adj <= 0:
-        return 0.0, 0.0, "QTY_ADJ_LE0"
+        return commit("SKIP", 0.0, 0.0, "QTY_ADJ_LE0")
 
-    return qty_adj, notional_adj, None
+    decision = "BUMP" if bumped else "OK"
+    extra = {
+        "qty_after_step": qty_after_step,
+        "qty_after_min_qty": qty_after_min_qty,
+        "qty_final": float(qty_adj),
+        "notional_final": float(notional_adj),
+    }
+    if bump_target is not None:
+        extra.update({
+            "target_notional": float(bump_target),
+            "req_margin": float(bump_req_margin) if bump_req_margin is not None else None,
+            "cap_margin": float(bump_cap_margin) if bump_cap_margin is not None else None,
+            "cap_equity": float(bump_cap_equity) if bump_cap_equity is not None else None,
+        })
+
+    # One-line summary (helps in live console)
+    try:
+        console.print(
+            f"[dim]SIZING[/dim] {symbol} qty={qty_adj:g} notional≈{notional_adj:.4g} (in={qty_in:g}, px={px:.4g}) decision={decision}"
+        )
+    except Exception:
+        pass
+
+    return commit(decision, qty_adj, notional_adj, None, extra)
+
+
+async def _auto_remediate_entry_and_retry(
+    *,
+    enabled: bool,
+    cooldown: Any,
+    adapter: Any,
+    executor: Any,
+    venue: str,
+    symbol: str,
+    side: str,
+    qty_raw: float,
+    qty_current: float,
+    intended_notional: float,
+    last_price: float,
+    equity: float,
+    cfg: LiveConfig,
+    console: Console,
+    now_ms: int,
+    raw: Any,
+) -> tuple[Optional[Any], Optional[float], Optional[float], str]:
+    """Best-effort self-healing for ENTRY rejects.
+
+    Returns (res_retry, new_qty, new_intended_notional, note).
+    - If no retry performed: (None, None, None, "")
+    - If retry performed: res_retry is an ExecutionResult
+    """
+    try:
+        if not enabled:
+            return None, None, None, ""
+        if executor is None or adapter is None:
+            return None, None, None, ""
+
+        max_retries = int(getattr(cfg, "scalp_auto_remediate_max_retries", 1) or 1)
+        if max_retries <= 0:
+            return None, None, None, ""
+
+        # classify using cooldown helper (same categories as cooldowns)
+        info: dict = {}
+        try:
+            info = cooldown.classify_failure(raw)  # type: ignore[attr-defined]
+        except Exception:
+            info = {}
+        if not info:
+            return None, None, None, ""
+
+        cat = str(info.get("category") or "")
+        code = info.get("code")
+        msg = str(info.get("msg") or "")
+        hs = info.get("http_status")
+
+        # one-shot only: we implement retry loop via max_retries but default 1
+        retries = 0
+        cur_qty = float(qty_current or 0.0)
+        cur_notional = float(intended_notional or 0.0)
+
+        while retries < max_retries:
+            retries += 1
+            note = ""
+
+            # --- Timestamp / recvWindow ---
+            if cat == "timestamp":
+                if hasattr(adapter, "sync_time") and callable(getattr(adapter, "sync_time")):
+                    try:
+                        off = await adapter.sync_time()
+                        note = f"time_sync(offset_ms={off})"
+                        console.print(f"[dim]REMEDIATE[/dim] {symbol} {note} -> retry")
+                    except Exception:
+                        pass
+
+            # --- Refresh exchange rules (stepSize/minNotional/precision) ---
+            elif cat in {"filter_fail", "precision", "min_notional"}:
+                if hasattr(adapter, "refresh_symbol_rules") and callable(getattr(adapter, "refresh_symbol_rules")):
+                    try:
+                        await adapter.refresh_symbol_rules(symbol, order_type="MARKET")
+                        note = f"refresh_symbol_rules(cat={cat})"
+                        console.print(f"[dim]REMEDIATE[/dim] {symbol} {note}")
+                    except Exception:
+                        pass
+
+                # recompute qty using refreshed rules
+                try:
+                    # start from the same intended notional
+                    qty_raw2 = float(cur_notional) / max(1e-12, float(last_price or 0.0))
+                    new_qty, new_notional, skip_reason = await _adjust_qty_by_rules(
+                        adapter=adapter,
+                        venue=venue,
+                        symbol=symbol,
+                        order_type="MARKET",
+                        last_price=float(last_price),
+                        qty=float(qty_raw2),
+                        equity=float(equity or 0.0),
+                        intended_notional=float(cur_notional),
+                        cfg=cfg,
+                        console=console,
+                    )
+                    if skip_reason:
+                        console.print(f"[dim]REMEDIATE[/dim] {symbol} sizing re-check -> SKIP ({skip_reason})")
+                        return None, None, None, ""
+                    cur_qty = float(new_qty)
+                    cur_notional = float(new_notional)
+                    note = note or f"recompute_qty(cat={cat})"
+                except Exception:
+                    return None, None, None, ""
+
+            # --- Insufficient margin: shrink size and retry once ---
+            elif cat == "insufficient_margin":
+                shrink = float(getattr(cfg, "scalp_auto_remediate_margin_shrink", 0.7) or 0.7)
+                shrink = max(0.05, min(0.95, shrink))
+                cur_notional = float(cur_notional) * shrink
+                try:
+                    qty_raw2 = float(cur_notional) / max(1e-12, float(last_price or 0.0))
+                    new_qty, new_notional, skip_reason = await _adjust_qty_by_rules(
+                        adapter=adapter,
+                        venue=venue,
+                        symbol=symbol,
+                        order_type="MARKET",
+                        last_price=float(last_price),
+                        qty=float(qty_raw2),
+                        equity=float(equity or 0.0),
+                        intended_notional=float(cur_notional),
+                        cfg=cfg,
+                        console=console,
+                    )
+                    if skip_reason:
+                        return None, None, None, ""
+                    cur_qty = float(new_qty)
+                    cur_notional = float(new_notional)
+                    note = f"shrink_notional(x{shrink:g})"
+                    console.print(f"[dim]REMEDIATE[/dim] {symbol} {note} -> retry")
+                except Exception:
+                    return None, None, None, ""
+
+            # --- Max open orders: cancel bot-owned stale open orders then retry ---
+            elif cat == "max_open_orders":
+                do_cancel = bool(getattr(cfg, "scalp_auto_remediate_cancel_own_open_orders", True))
+                if do_cancel and hasattr(adapter, "cancel_own_open_orders") and callable(getattr(adapter, "cancel_own_open_orders")):
+                    age = int(getattr(cfg, "scalp_auto_remediate_cancel_age_sec", 60) or 60)
+                    try:
+                        res_cancel = await adapter.cancel_own_open_orders(symbol, min_age_sec=age)
+                        note = f"cancel_own_open_orders(canceled={res_cancel.get('canceled')}, scanned={res_cancel.get('scanned')})"
+                        console.print(f"[dim]REMEDIATE[/dim] {symbol} {note} -> retry")
+                    except Exception:
+                        pass
+
+            # --- Position side mismatch: try explicit LONG/SHORT hint and retry ---
+            elif cat == "position_side":
+                # We can't know if it's hedge/one-way without permissions; send hint and let adapter decide.
+                note = "positionSide_hint"
+                console.print(f"[dim]REMEDIATE[/dim] {symbol} {note} -> retry")
+            else:
+                return None, None, None, ""
+
+            # Retry market order (single shot)
+            try:
+                client_oid = f"{symbol}-ENTRY-RETRY-{int(time.time() * 1000)}"
+                meta = {}
+                if cat == "position_side":
+                    meta["positionSide"] = "LONG" if str(side).upper() == "BUY" else "SHORT"
+                res_retry = await executor.execute(OrderRequest(venue=venue, symbol=symbol, side=side, qty=float(cur_qty), order_type="MARKET", client_order_id=client_oid, meta=meta))
+                return res_retry, float(cur_qty), float(cur_notional), note
+            except Exception as e:
+                console.print(f"[dim]REMEDIATE[/dim] {symbol} retry exception: {e}")
+                return None, None, None, ""
+
+        return None, None, None, ""
+    except Exception:
+        return None, None, None, ""
 
 
 def _orderbook_l2(venue: str, ob_raw: Any, depth: int = 10) -> Optional[dict]:
@@ -717,6 +1052,33 @@ async def run_live(cfg: LiveConfig) -> None:
     global_store = GlobalExposureStore(cfg.global_risk_path) if cfg.global_risk_path else None
     last_equity_log_ms = 0
 
+    # Entry cooldowns (prevents order spam / auto backoff on repeated rejects)
+    cooldown = CooldownManager(
+        enabled=bool(getattr(cfg, "scalp_cooldown_enabled", True)),
+        after_exit_fill_sec=int(getattr(cfg, "scalp_cooldown_after_exit_fill_sec", 2) or 2),
+        after_entry_fill_sec=int(getattr(cfg, "scalp_cooldown_after_entry_fill_sec", 0) or 0),
+        reject_base_sec=int(getattr(cfg, "scalp_cooldown_reject_base_sec", 10) or 10),
+        http400_sec=int(getattr(cfg, "scalp_cooldown_http400_sec", 30) or 30),
+        http401_sec=int(getattr(cfg, "scalp_cooldown_http401_sec", 600) or 600),
+        rate_limit_sec=int(getattr(cfg, "scalp_cooldown_rate_limit_sec", 5) or 5),
+        insufficient_margin_sec=int(getattr(cfg, "scalp_cooldown_insufficient_margin_sec", 180) or 180),
+        min_notional_sec=int(getattr(cfg, "scalp_cooldown_min_notional_sec", 300) or 300),
+        filter_fail_sec=int(getattr(cfg, "scalp_cooldown_filter_fail_sec", 60) or 60),
+        precision_sec=int(getattr(cfg, "scalp_cooldown_precision_sec", 60) or 60),
+        position_side_sec=int(getattr(cfg, "scalp_cooldown_position_side_sec", 600) or 600),
+        reduce_only_sec=int(getattr(cfg, "scalp_cooldown_reduce_only_sec", 60) or 60),
+        trigger_immediate_sec=int(getattr(cfg, "scalp_cooldown_trigger_immediate_sec", 20) or 20),
+        timestamp_sec=int(getattr(cfg, "scalp_cooldown_timestamp_sec", 10) or 10),
+        max_open_orders_sec=int(getattr(cfg, "scalp_cooldown_max_open_orders_sec", 120) or 120),
+        liquidation_sec=int(getattr(cfg, "scalp_cooldown_liquidation_sec", 600) or 600),
+        backoff_mult=float(getattr(cfg, "scalp_cooldown_backoff_mult", 2.0) or 2.0),
+        max_sec=int(getattr(cfg, "scalp_cooldown_max_sec", 900) or 900),
+        fail_window_sec=int(getattr(cfg, "scalp_cooldown_fail_window_sec", 180) or 180),
+        account_tag=acct_tag,
+        venue=venue,
+        mode=cfg.mode,
+    )
+
     pressure = TradePressureBook(window_sec=cfg.scalp_pressure_window_sec)
     flow = TradeFlowBook(window_sec=cfg.scalp_flow_window_sec, large_trade_min_notional=cfg.scalp_large_trade_min_notional)
     ob_delta = OrderbookDeltaBook()
@@ -738,6 +1100,9 @@ async def run_live(cfg: LiveConfig) -> None:
     # UI/debug tapes (in-memory ring buffers)
     event_tape: Dict[str, Any] = {s: deque(maxlen=80) for s in cfg.symbols}
     last_signal: Dict[str, Any] = {s: {} for s in cfg.symbols}
+
+    # Per-symbol safety disable (manual-fix required situations: 401, liquidation risk, etc.)
+    entry_disabled_until_ms: Dict[str, int] = {s: 0 for s in cfg.symbols}
 
     stock_venues = {"kiwoom", "namoo_stock", "kis", "namoo"}
     bar_builders = {s: SimpleMinuteBarBuilder() for s in cfg.symbols} if venue in stock_venues else {}
@@ -851,6 +1216,9 @@ async def run_live(cfg: LiveConfig) -> None:
                     meta = {}
                     if venue == "binance_futures":
                         meta["reduceOnly"] = True
+                        # For Hedge Mode accounts, Binance requires positionSide=LONG/SHORT even for reduceOnly exits.
+                        # Adapter will omit/adjust this hint automatically if account is One-way.
+                        meta["positionSide"] = "LONG" if pos.qty > 0 else "SHORT"
 
                     res = None
                     if trading_enabled:
@@ -921,6 +1289,12 @@ async def run_live(cfg: LiveConfig) -> None:
                         except Exception:
                             pass
 
+                        # Prevent immediate re-entry flip-flop after closing.
+                        try:
+                            cooldown.on_exit_filled(symbol, now_ms=now_ms)
+                        except Exception:
+                            pass
+
                     if res is None:
                         console.print(f"[yellow]EXIT[/yellow] {symbol} {decision.reason} DRYRUN")
                     else:
@@ -965,6 +1339,19 @@ async def run_live(cfg: LiveConfig) -> None:
                         sig = None
 
                     if sig is not None and sig.side in {"BUY", "SELL"}:
+                        # Per-symbol disable gate (manual-fix situations)
+                        dis_until = int(entry_disabled_until_ms.get(symbol, 0) or 0)
+                        if dis_until and now_ms < dis_until:
+                            left = max(0.0, (dis_until - now_ms) / 1000.0)
+                            console.print(f"[dim]SKIP[/dim] {symbol} entry disabled for {left:.0f}s")
+                            continue
+
+                        # Cooldown gate (entries only)
+                        allow_entry, cd_reason = cooldown.allow_entry(symbol, now_ms)
+                        if not allow_entry:
+                            console.print(f"[dim]SKIP[/dim] {symbol} {cd_reason}")
+                            continue
+
                         # Sizing (compute intended notional and adjust qty to exchange rules)
                         intended_notional = _compute_intended_notional(
                             venue=venue,
@@ -1082,6 +1469,128 @@ async def run_live(cfg: LiveConfig) -> None:
                                 except Exception:
                                     pass
 
+                                # Successful entry resets backoff; optional tiny cooldown
+                                try:
+                                    cooldown.on_entry_filled(symbol, now_ms=now_ms)
+                                except Exception:
+                                    pass
+                            else:
+                                # Entry rejected: optional auto-remediation + cooldown/backoff
+                                remediated_success = False
+                                remediation_note = ""
+                                final_res = res
+
+                                if res is not None:
+                                    raw0 = (res.update.raw or {})
+                                    info0 = {}
+                                    try:
+                                        info0 = cooldown.classify_failure(raw0)
+                                    except Exception:
+                                        info0 = {}
+                                    cat0 = str(info0.get("category") or "")
+
+                                    # Some categories require manual intervention; disable entries for a while.
+                                    if cat0 == "unauthorized":
+                                        disable_sec = int(getattr(cfg, "scalp_auto_remediate_disable_on_unauthorized_sec", 3600) or 3600)
+                                        entry_disabled_until_ms[symbol] = now_ms + disable_sec * 1000
+                                        console.print(f"[bold red]ENTRY DISABLED[/bold red] {symbol} unauthorized(401). Check API key/permissions. ({disable_sec}s)")
+                                    elif cat0 == "liquidation":
+                                        disable_sec = int(getattr(cfg, "scalp_auto_remediate_disable_on_liquidation_sec", 3600) or 3600)
+                                        entry_disabled_until_ms[symbol] = now_ms + disable_sec * 1000
+                                        console.print(f"[bold red]ENTRY DISABLED[/bold red] {symbol} liquidation/position risk. ({disable_sec}s)")
+
+                                    # Try best-effort remediation for eligible categories (single retry).
+                                    auto_on = bool(getattr(cfg, "scalp_auto_remediate_enabled", True))
+                                    if auto_on and trading_enabled and cat0 not in {"unauthorized", "liquidation"}:
+                                        try:
+                                            res_retry, new_qty, new_notional, note = await _auto_remediate_entry_and_retry(
+                                                enabled=True,
+                                                cooldown=cooldown,
+                                                adapter=adapter,
+                                                executor=executor,
+                                                venue=venue,
+                                                symbol=symbol,
+                                                side=side,
+                                                qty_raw=float(qty_raw),
+                                                qty_current=float(qty),
+                                                intended_notional=float(intended_notional),
+                                                last_price=float(last_price),
+                                                equity=float(equity or 0.0),
+                                                cfg=cfg,
+                                                console=console,
+                                                now_ms=now_ms,
+                                                raw=raw0,
+                                            )
+                                            if res_retry is not None:
+                                                final_res = res_retry
+                                                remediation_note = str(note or "")
+                                                if _exec_success(res_retry):
+                                                    # Treat as normal fill (remediation succeeded)
+                                                    filled_qty = float(res_retry.update.filled_qty)
+                                                    fill_px = float(res_retry.update.avg_fill_price or last_price)
+                                                    notional = filled_qty * fill_px
+                                                    fee = float(res_retry.update.fee or _estimate_fee(venue, notional))
+                                                    tracker.apply_fill(symbol, side, filled_qty, fill_px, fee=fee)
+                                                    append_event(
+                                                        {
+                                                            "ts": ts.isoformat(),
+                                                            "venue": venue,
+                                                            "account_tag": acct_tag,
+                                                            "mode": cfg.mode,
+                                                            "simulated": bool(cfg.mode != "live"),
+                                                            "symbol": symbol,
+                                                            "side": side,
+                                                            "qty": filled_qty,
+                                                            "price": fill_px,
+                                                            "fee": fee,
+                                                            "order_id": str(res_retry.update.order_id or ""),
+                                                            "client_order_id": str(res_retry.update.client_order_id or ""),
+                                                            "order_status": str(res_retry.update.status or ""),
+                                                            "reason": "ENTRY",
+                                                            "signal": {"side": sig.side, "score": sig.score, "meta": sig.meta},
+                                                            "remediation": remediation_note,
+                                                        }
+                                                    )
+                                                    try:
+                                                        event_tape[symbol].append({"ts": ts.isoformat(), "type": "ENTRY", "side": side, "qty": filled_qty, "price": fill_px, "fee": fee, "score": float(sig.score), "remediation": remediation_note})
+                                                    except Exception:
+                                                        pass
+                                                    try:
+                                                        cooldown.on_entry_filled(symbol, now_ms=now_ms)
+                                                    except Exception:
+                                                        pass
+                                                    remediated_success = True
+                                        except Exception:
+                                            pass
+
+                                    # If still failing due to position side, disable briefly (prevents spam).
+                                    if (not remediated_success) and cat0 == "position_side":
+                                        disable_sec = int(getattr(cfg, "scalp_auto_remediate_disable_on_position_side_sec", 900) or 900)
+                                        entry_disabled_until_ms[symbol] = max(int(entry_disabled_until_ms.get(symbol, 0) or 0), now_ms + disable_sec * 1000)
+
+                                # Apply cooldown only if we did not manage to fill.
+                                if not remediated_success:
+                                    if final_res is not None:
+                                        try:
+                                            cooldown.on_entry_failed(
+                                                symbol,
+                                                now_ms=now_ms,
+                                                status=str(final_res.update.status or "REJECTED"),
+                                                raw=(final_res.update.raw or {}),
+                                            )
+                                            ev = cooldown.last_event(symbol)
+                                            if isinstance(ev, dict):
+                                                try:
+                                                    print(
+                                                        f"COOLDOWN: {symbol} {ev.get('cooldown_sec')}s reason={ev.get('reason')} cat={ev.get('category')} code={ev.get('code')} | {ev.get('recommend_action')}"
+                                                    )
+                                                except Exception:
+                                                    pass
+                                        except Exception:
+                                            pass
+
+                                res = final_res
+
                             if res is None:
                                 console.print(f"[green]ENTRY[/green] {symbol} {sig.side} score={sig.score:.2f} DRYRUN")
                             else:
@@ -1139,6 +1648,7 @@ async def run_live(cfg: LiveConfig) -> None:
                     "trades": recent_trades,
                     "events": list(event_tape.get(symbol) or []),
                     "last_signal": last_signal.get(symbol) or {},
+                    "cooldown": cooldown.snapshot(symbol, now_ms=now_ms),
                     "candles_1m": _candles_for_ui(df_1m, limit=240),
                 }
                 _write_bot_state(cfg, symbol, state_payload)

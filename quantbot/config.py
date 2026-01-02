@@ -113,6 +113,60 @@ class Settings(BaseSettings):
     SCALP_NEWS_SPIKE_MOVE_PCT: float = 0.007
     SCALP_NEWS_COOLDOWN_SEC: int = 300
 
+    # --- Cooldowns (prevents order spam / auto backoff on repeated rejects) ---
+    # Cooldowns gate *new entries* only (risk exits are never blocked).
+    SCALP_COOLDOWN_ENABLED: bool = True
+    # After a successful EXIT fill, wait this long before allowing a new entry.
+    SCALP_COOLDOWN_AFTER_EXIT_FILL_SEC: int = 2
+    # After an ENTRY fill, you usually stay in-position; keep this small.
+    SCALP_COOLDOWN_AFTER_ENTRY_FILL_SEC: int = 0
+
+    # Base cooldown after any rejected/failed ENTRY attempt.
+    SCALP_COOLDOWN_REJECT_BASE_SEC: int = 10
+    # Optional special cases (when we can classify the error).
+    SCALP_COOLDOWN_HTTP400_SEC: int = 30
+    SCALP_COOLDOWN_HTTP401_SEC: int = 600
+    SCALP_COOLDOWN_RATE_LIMIT_SEC: int = 5
+    SCALP_COOLDOWN_INSUFFICIENT_MARGIN_SEC: int = 180
+
+    # Cause-specific recommended cooldowns (entry failures only).
+    # Used when we can infer the root cause from (http_status, error code, msg).
+    # These are *base* cooldowns, still subject to exponential backoff.
+    SCALP_COOLDOWN_MIN_NOTIONAL_SEC: int = 300
+    SCALP_COOLDOWN_FILTER_FAIL_SEC: int = 60
+    SCALP_COOLDOWN_PRECISION_SEC: int = 60
+    SCALP_COOLDOWN_POSITION_SIDE_SEC: int = 600
+    SCALP_COOLDOWN_REDUCE_ONLY_SEC: int = 60
+    SCALP_COOLDOWN_TRIGGER_IMMEDIATE_SEC: int = 20
+    SCALP_COOLDOWN_TIMESTAMP_SEC: int = 10
+    SCALP_COOLDOWN_MAX_OPEN_ORDERS_SEC: int = 120
+    SCALP_COOLDOWN_LIQUIDATION_SEC: int = 600
+
+    # Exponential backoff for repeated failures (per symbol).
+    SCALP_COOLDOWN_BACKOFF_MULT: float = 2.0
+    SCALP_COOLDOWN_MAX_SEC: int = 900
+    # If failures are separated by more than this window, failure counter resets.
+    SCALP_COOLDOWN_FAIL_WINDOW_SEC: int = 180
+
+    # --- Auto remediation (best-effort self-healing after entry failures) ---
+    # When an ENTRY is rejected, the bot can attempt a safe one-shot remediation
+    # (time sync, refresh exchange rules, cancel own stale open orders, shrink size)
+    # and retry once before applying cooldown.
+    SCALP_AUTO_REMEDIATE_ENABLED: bool = True
+    SCALP_AUTO_REMEDIATE_MAX_RETRIES: int = 1
+
+    # If insufficient margin, shrink intended notional by this factor for retry.
+    SCALP_AUTO_REMEDIATE_MARGIN_SHRINK: float = 0.7
+
+    # On max open orders, cancel own open orders older than this age (sec) before retry.
+    SCALP_AUTO_REMEDIATE_CANCEL_OWN_OPEN_ORDERS: bool = True
+    SCALP_AUTO_REMEDIATE_CANCEL_AGE_SEC: int = 60
+
+    # If we detect a "needs manual fix" situation, disable entries for this long (sec).
+    SCALP_AUTO_REMEDIATE_DISABLE_ON_UNAUTHORIZED_SEC: int = 3600
+    SCALP_AUTO_REMEDIATE_DISABLE_ON_LIQUIDATION_SEC: int = 3600
+    SCALP_AUTO_REMEDIATE_DISABLE_ON_POSITION_SIDE_SEC: int = 900
+
     # --- Exchange credentials ---
     UPBIT_ACCESS_KEY: str | None = None
     UPBIT_SECRET_KEY: str | None = None

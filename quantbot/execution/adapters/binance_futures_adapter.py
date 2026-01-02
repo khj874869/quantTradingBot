@@ -93,13 +93,124 @@ class BinanceFuturesAdapter(BrokerAdapter):
         self._exchange_info_cache: dict[str, Any] | None = None
         self._symbol_rules_cache: dict[str, SymbolRules] = {}
 
+        self._time_offset_ms: int = 0
+        self._dual_side_cache: Optional[bool] = None
+        self._dual_side_cache_ts_ms: int = 0
+
     def _ts(self) -> int:
-        return int(time.time() * 1000)
+        return int(time.time() * 1000) + int(self._time_offset_ms or 0)
+
+    async def sync_time(self) -> int:
+        """Sync local clock offset against Binance server time.
+
+        Returns the computed offset (server_ms - local_ms).
+        """
+        try:
+            data = await self._public_get("/fapi/v1/time", {})
+            server_ms = int(data.get("serverTime") or 0)
+            local_ms = int(time.time() * 1000)
+            if server_ms > 0:
+                self._time_offset_ms = int(server_ms - local_ms)
+            return int(self._time_offset_ms or 0)
+        except Exception:
+            return int(self._time_offset_ms or 0)
+
+    async def get_dual_side_position(self, *, max_age_sec: int = 300) -> Optional[bool]:
+        """Return True if account is Hedge Mode (dualSidePosition), False if One-way, None on failure."""
+        try:
+            now_ms = int(time.time() * 1000)
+            if self._dual_side_cache is not None and (now_ms - int(self._dual_side_cache_ts_ms or 0)) < int(max_age_sec * 1000):
+                return bool(self._dual_side_cache)
+            data = await self._signed_request("GET", "/fapi/v1/positionSide/dual", {})
+            # response: {"dualSidePosition": true}
+            dual = bool(data.get("dualSidePosition"))
+            self._dual_side_cache = dual
+            self._dual_side_cache_ts_ms = now_ms
+            return dual
+        except Exception:
+            return None
+
+    def invalidate_exchange_info(self) -> None:
+        self._exchange_info_cache = None
+
+    def invalidate_symbol_rules(self, symbol: Optional[str] = None) -> None:
+        if symbol is None:
+            self._symbol_rules_cache = {}
+        else:
+            s = self._normalize_symbol(symbol)
+            if s in self._symbol_rules_cache:
+                del self._symbol_rules_cache[s]
+
+    async def refresh_symbol_rules(self, symbol: str, *, order_type: str = "MARKET") -> Optional[SymbolRules]:
+        """Force-refresh exchangeInfo + symbol rules cache."""
+        try:
+            self.invalidate_exchange_info()
+            self.invalidate_symbol_rules(symbol)
+            return await self.get_symbol_rules(symbol, order_type=str(order_type).upper())
+        except Exception:
+            return None
+
+    async def list_open_orders(self, symbol: str) -> list[dict[str, Any]]:
+        sym = self._normalize_symbol(symbol)
+        data = await self._signed_request("GET", "/fapi/v1/openOrders", {"symbol": sym})
+        if isinstance(data, list):
+            return data
+        return []
+
+    async def cancel_order(self, symbol: str, *, order_id: Optional[str] = None, orig_client_order_id: Optional[str] = None) -> bool:
+        sym = self._normalize_symbol(symbol)
+        params: Dict[str, Any] = {"symbol": sym}
+        if order_id:
+            params["orderId"] = order_id
+        if orig_client_order_id:
+            params["origClientOrderId"] = orig_client_order_id
+        if not (order_id or orig_client_order_id):
+            return False
+        try:
+            await self._signed_request("DELETE", "/fapi/v1/order", params)
+            return True
+        except Exception:
+            return False
+
+    async def cancel_own_open_orders(self, symbol: str, *, min_age_sec: int = 60) -> Dict[str, Any]:
+        """Cancel bot-owned open orders (best-effort) to recover from max-open-orders.
+
+        Cancels only orders whose clientOrderId looks like QuantBot generated:
+          - contains '-ENTRY-' or '-EXIT-'
+          - or startswith '{SYMBOL}-'
+        and older than min_age_sec.
+        """
+        out = {"canceled": 0, "scanned": 0}
+        try:
+            sym = self._normalize_symbol(symbol)
+            now_ms = int(time.time() * 1000)
+            min_age_ms = int(max(0, min_age_sec) * 1000)
+            orders = await self.list_open_orders(sym)
+            out["scanned"] = len(orders)
+            for o in orders:
+                try:
+                    coid = str(o.get("clientOrderId") or "")
+                    oid = str(o.get("orderId") or "")
+                    t = int(o.get("time") or o.get("updateTime") or 0)
+                    age = now_ms - t if t else 0
+                    looks_like_bot = ("-ENTRY-" in coid) or ("-EXIT-" in coid) or coid.startswith(f"{sym}-")
+                    if not looks_like_bot:
+                        continue
+                    if min_age_ms and age and age < min_age_ms:
+                        continue
+                    ok = await self.cancel_order(sym, order_id=oid or None, orig_client_order_id=coid or None)
+                    if ok:
+                        out["canceled"] += 1
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return out
 
     def _sign(self, query: str) -> str:
         return hmac.new(self.api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
 
-    async def _signed_request(self, method: str, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    async def _signed_request(self, method: str, path: str, params: Dict[str, Any]) -> Any:
         if not self.api_key or not self.api_secret:
             raise RuntimeError(
                 "BINANCE_API_KEY/BINANCE_API_SECRET not set; cannot call signed endpoints (account/equity/orders)."
@@ -117,7 +228,7 @@ class BinanceFuturesAdapter(BrokerAdapter):
         r.raise_for_status()
         return r.json()
 
-    async def _public_get(self, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    async def _public_get(self, path: str, params: Dict[str, Any]) -> Any:
         url = f"{self.base_url}{path}"
         r = await self.client.get(url, params=params)
         r.raise_for_status()
@@ -152,8 +263,39 @@ class BinanceFuturesAdapter(BrokerAdapter):
         # Futures-specific flags
         if meta.get("reduceOnly") is not None:
             params["reduceOnly"] = "true" if bool(meta.get("reduceOnly")) else "false"
-        if meta.get("positionSide") is not None:
-            params["positionSide"] = meta.get("positionSide")  # LONG/SHORT (hedge mode)
+
+        # positionSide handling (hedge vs one-way)
+        desired_ps = meta.get("positionSide")
+        ps_param: Optional[str] = None
+        try:
+            desired_str = str(desired_ps).upper() if desired_ps is not None else ""
+        except Exception:
+            desired_str = ""
+        dual = None
+        try:
+            dual = await self.get_dual_side_position()
+        except Exception:
+            dual = None
+
+        if dual is True:
+            # Hedge mode requires LONG/SHORT.
+            if desired_str in {"LONG", "SHORT"}:
+                ps_param = desired_str
+            else:
+                ps_param = "LONG" if side == "BUY" else "SHORT"
+        elif dual is False:
+            # One-way mode: omit positionSide (or BOTH if explicitly requested).
+            if desired_str == "BOTH":
+                ps_param = "BOTH"
+            else:
+                ps_param = None
+        else:
+            # Unknown; be conservative (omit) unless explicitly provided.
+            if desired_str in {"LONG", "SHORT", "BOTH"}:
+                ps_param = desired_str
+
+        if ps_param is not None:
+            params["positionSide"] = ps_param
 
         if order_type == "LIMIT":
             if req.price is None:
@@ -310,55 +452,55 @@ class BinanceFuturesAdapter(BrokerAdapter):
 
     
 
-async def get_exchange_info(self) -> Dict[str, Any]:
-    """Return /fapi/v1/exchangeInfo (cached)."""
-    if self._exchange_info_cache is None:
-        self._exchange_info_cache = await self._public_get("/fapi/v1/exchangeInfo", {})
-    return self._exchange_info_cache
+    async def get_exchange_info(self) -> Dict[str, Any]:
+        """Return /fapi/v1/exchangeInfo (cached)."""
+        if self._exchange_info_cache is None:
+            self._exchange_info_cache = await self._public_get("/fapi/v1/exchangeInfo", {})
+        return self._exchange_info_cache
 
 
-async def get_symbol_rules(self, symbol: str, *, order_type: str = "MARKET") -> SymbolRules:
-    """Fetch and cache per-symbol trading rules (step size, min qty, min notional)."""
-    sym = self._normalize_symbol(symbol)
-    if sym in self._symbol_rules_cache:
-        return self._symbol_rules_cache[sym]
+    async def get_symbol_rules(self, symbol: str, *, order_type: str = "MARKET") -> SymbolRules:
+        """Fetch and cache per-symbol trading rules (step size, min qty, min notional)."""
+        sym = self._normalize_symbol(symbol)
+        if sym in self._symbol_rules_cache:
+            return self._symbol_rules_cache[sym]
 
-    info = await self.get_exchange_info()
-    symbols = info.get("symbols") or []
-    target = None
-    for s in symbols:
-        try:
-            if str(s.get("symbol")) == sym:
-                target = s
-                break
-        except Exception:
-            continue
-    if not target:
-        raise ValueError(f"Symbol not found in exchangeInfo: {sym}")
+        info = await self.get_exchange_info()
+        symbols = info.get("symbols") or []
+        target = None
+        for s in symbols:
+            try:
+                if str(s.get("symbol")) == sym:
+                    target = s
+                    break
+            except Exception:
+                continue
+        if not target:
+            raise ValueError(f"Symbol not found in exchangeInfo: {sym}")
 
-    filters = target.get("filters") or []
-    # Prefer MARKET_LOT_SIZE for market orders if present; otherwise LOT_SIZE.
-    lot = None
-    if str(order_type).upper() == "MARKET":
-        lot = _find_filter(filters, "MARKET_LOT_SIZE") or _find_filter(filters, "LOT_SIZE")
-    else:
-        lot = _find_filter(filters, "LOT_SIZE") or _find_filter(filters, "MARKET_LOT_SIZE")
-    if not lot:
-        raise ValueError(f"LOT_SIZE filter missing for {sym}")
+        filters = target.get("filters") or []
+        # Prefer MARKET_LOT_SIZE for market orders if present; otherwise LOT_SIZE.
+        lot = None
+        if str(order_type).upper() == "MARKET":
+            lot = _find_filter(filters, "MARKET_LOT_SIZE") or _find_filter(filters, "LOT_SIZE")
+        else:
+            lot = _find_filter(filters, "LOT_SIZE") or _find_filter(filters, "MARKET_LOT_SIZE")
+        if not lot:
+            raise ValueError(f"LOT_SIZE filter missing for {sym}")
 
-    step = _safe_float(lot.get("stepSize"), 0.0)
-    min_qty = _safe_float(lot.get("minQty"), 0.0)
-    max_qty = _safe_float(lot.get("maxQty"), 0.0) if lot.get("maxQty") is not None else float("inf")
-    min_notional = _extract_min_notional(filters)
-    qty_precision = None
-    try:
-        qty_precision = int(target.get("quantityPrecision")) if target.get("quantityPrecision") is not None else None
-    except Exception:
+        step = _safe_float(lot.get("stepSize"), 0.0)
+        min_qty = _safe_float(lot.get("minQty"), 0.0)
+        max_qty = _safe_float(lot.get("maxQty"), 0.0) if lot.get("maxQty") is not None else float("inf")
+        min_notional = _extract_min_notional(filters)
         qty_precision = None
+        try:
+            qty_precision = int(target.get("quantityPrecision")) if target.get("quantityPrecision") is not None else None
+        except Exception:
+            qty_precision = None
 
-    rules = SymbolRules(symbol=sym, qty_step=step, min_qty=min_qty, max_qty=max_qty, min_notional=min_notional, qty_precision=qty_precision)
-    self._symbol_rules_cache[sym] = rules
-    return rules
+        rules = SymbolRules(symbol=sym, qty_step=step, min_qty=min_qty, max_qty=max_qty, min_notional=min_notional, qty_precision=qty_precision)
+        self._symbol_rules_cache[sym] = rules
+        return rules
 
-async def close(self) -> None:
+    async def close(self) -> None:
         await self.client.aclose()
