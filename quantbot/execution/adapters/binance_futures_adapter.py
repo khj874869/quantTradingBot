@@ -40,11 +40,16 @@ class BinanceFuturesAdapter(BrokerAdapter):
         return hmac.new(self.api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
 
     async def _signed_request(self, method: str, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.api_key or not self.api_secret:
+            raise RuntimeError(
+                "BINANCE_API_KEY/BINANCE_API_SECRET not set; cannot call signed endpoints (account/equity/orders)."
+            )
+
         params = {k: v for k, v in params.items() if v is not None}
         params.setdefault("timestamp", self._ts())
         # Allow some clock drift / network jitter.
         params.setdefault("recvWindow", 5000)
-        query = httpx.QueryParams(params).render()
+        query = str(httpx.QueryParams(params))
         sig = self._sign(query)
         url = f"{self.base_url}{path}?{query}&signature={sig}"
         headers = {"X-MBX-APIKEY": self.api_key}
