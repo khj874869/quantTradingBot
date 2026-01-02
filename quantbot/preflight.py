@@ -128,6 +128,21 @@ async def run(args) -> int:
         console.print("[bold red]Refusing to place order[/bold red]: TRADING_ENABLED=false")
         return 2
 
+    # Optional futures setup (safe-ish but still modifies account settings)
+    if venue == "binance_futures" and args.leverage is not None:
+        try:
+            await adapter.set_leverage(args.symbol, int(args.leverage))
+            console.print(f"[cyan]Set leverage[/cyan] {args.symbol} -> {int(args.leverage)}x")
+        except Exception as e:
+            console.print(f"[red]set_leverage failed[/red]: {e}")
+            return 2
+
+    meta: Dict[str, Any] = {}
+    if bool(args.reduce_only):
+        meta["reduceOnly"] = True
+    if args.position_side is not None:
+        meta["positionSide"] = str(args.position_side)
+
     req = OrderRequest(
         venue=venue,  # type: ignore[arg-type]
         symbol=args.symbol,
@@ -136,10 +151,20 @@ async def run(args) -> int:
         qty=float(args.qty),
         price=float(args.price) if args.price is not None else None,
         client_order_id=f"PREFLIGHT-{int(utc_now().timestamp())}",
-        meta={"reduceOnly": bool(args.reduce_only)} if args.reduce_only is not None else {},
+        meta=meta,
     )
     res = await executor.execute(req)
     console.print(f"[bold yellow]ORDER RESULT[/bold yellow]: status={res.update.status} filled={res.update.filled_qty} avg={res.update.avg_fill_price} order_id={res.update.order_id}")
+
+    # If rejected (or no order id), dump raw details so users can see Binance's error code/msg.
+    st = str(res.update.status or "").upper()
+    if st == "REJECTED" or not (res.update.order_id or "").strip():
+        raw = res.update.raw or {}
+        try:
+            console.print("[dim]ORDER RAW[/dim]")
+            console.print_json(data=raw)
+        except Exception:
+            console.print(f"[dim]ORDER RAW[/dim] {raw}")
     return 0
 
 
@@ -153,6 +178,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--qty", type=float, default=0.0)
     p.add_argument("--price", type=float, default=None)
     p.add_argument("--reduce-only", action="store_true", help="Futures only")
+    p.add_argument(
+        "--position-side",
+        default=None,
+        choices=["LONG", "SHORT", "BOTH"],
+        help="Futures only (required in Hedge mode). Use LONG/SHORT in Hedge mode; omit or BOTH in One-way mode.",
+    )
+    p.add_argument(
+        "--leverage",
+        type=int,
+        default=None,
+        help="Futures only. If set, calls /fapi/v1/leverage before placing the order.",
+    )
     args = p.parse_args(argv)
 
     if args.do_order and args.qty <= 0:

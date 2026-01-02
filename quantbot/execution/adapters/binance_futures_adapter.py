@@ -110,6 +110,29 @@ class BinanceFuturesAdapter(BrokerAdapter):
         try:
             # IOC uses taker fee; for speed you may want price protection via slippage bps.
             data = await self._signed_request("POST", "/fapi/v1/order", params)
+        except httpx.HTTPStatusError as e:
+            # Binance returns JSON like: {"code": -2010, "msg": "..."}
+            body: Any
+            try:
+                body = e.response.json()
+            except Exception:
+                body = {"text": e.response.text}
+            return OrderUpdate(
+                venue=req.venue,
+                symbol=req.symbol,
+                order_id="",
+                client_order_id=req.client_order_id,
+                status="REJECTED",
+                filled_qty=0.0,
+                avg_fill_price=None,
+                fee=None,
+                raw={
+                    "error": "http_error",
+                    "http_status": int(getattr(e.response, "status_code", 0) or 0),
+                    "body": body,
+                    "request": params,
+                },
+            )
         except Exception as e:
             return OrderUpdate(
                 venue=req.venue,
@@ -120,7 +143,7 @@ class BinanceFuturesAdapter(BrokerAdapter):
                 filled_qty=0.0,
                 avg_fill_price=None,
                 fee=None,
-                raw={"error": str(e)},
+                raw={"error": str(e), "request": params},
             )
 
         status = str(data.get("status") or "NEW")
