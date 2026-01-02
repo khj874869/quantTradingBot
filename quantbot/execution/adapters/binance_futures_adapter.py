@@ -42,6 +42,8 @@ class BinanceFuturesAdapter(BrokerAdapter):
     async def _signed_request(self, method: str, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
         params = {k: v for k, v in params.items() if v is not None}
         params.setdefault("timestamp", self._ts())
+        # Allow some clock drift / network jitter.
+        params.setdefault("recvWindow", 5000)
         query = httpx.QueryParams(params).render()
         sig = self._sign(query)
         url = f"{self.base_url}{path}?{query}&signature={sig}"
@@ -59,6 +61,15 @@ class BinanceFuturesAdapter(BrokerAdapter):
     def _normalize_symbol(self, symbol: str) -> str:
         return symbol.replace("/", "").replace("-", "").upper()
 
+    @staticmethod
+    def _fmt_qty(x: float) -> str:
+        # Avoid scientific notation.
+        return f"{float(x):.10f}".rstrip("0").rstrip(".")
+
+    @staticmethod
+    def _fmt_price(x: float) -> str:
+        return f"{float(x):.10f}".rstrip("0").rstrip(".")
+
     async def place_order(self, req: OrderRequest) -> OrderUpdate:
         symbol = self._normalize_symbol(req.symbol)
         side = req.side.upper()
@@ -68,7 +79,7 @@ class BinanceFuturesAdapter(BrokerAdapter):
             "symbol": symbol,
             "side": side,
             "type": order_type,
-            "quantity": req.qty,
+            "quantity": self._fmt_qty(req.qty),
             "newClientOrderId": req.client_order_id,
         }
 
@@ -82,11 +93,30 @@ class BinanceFuturesAdapter(BrokerAdapter):
         if order_type == "LIMIT":
             if req.price is None:
                 raise ValueError("LIMIT order requires price")
-            params["price"] = req.price
+            params["price"] = self._fmt_price(req.price)
             params["timeInForce"] = meta.get("timeInForce", "GTC")
 
-        # IOC uses taker fee; for speed you may want price protection via slippage bps.
-        data = await self._signed_request("POST", "/fapi/v1/order", params)
+        # IMPORTANT:
+        # Futures REST "newOrderRespType" defaults to ACK on some accounts, which returns
+        # executedQty=0 even for MARKET orders. We prefer RESULT so the bot can reliably
+        # detect fills and journal them.
+        params["newOrderRespType"] = str(meta.get("newOrderRespType") or "RESULT")
+
+        try:
+            # IOC uses taker fee; for speed you may want price protection via slippage bps.
+            data = await self._signed_request("POST", "/fapi/v1/order", params)
+        except Exception as e:
+            return OrderUpdate(
+                venue=req.venue,
+                symbol=req.symbol,
+                order_id="",
+                client_order_id=req.client_order_id,
+                status="REJECTED",
+                filled_qty=0.0,
+                avg_fill_price=None,
+                fee=None,
+                raw={"error": str(e)},
+            )
 
         status = str(data.get("status") or "NEW")
         executed_qty = float(data.get("executedQty") or 0.0)
@@ -122,6 +152,44 @@ class BinanceFuturesAdapter(BrokerAdapter):
             raw=data,
         )
 
+    async def get_order_update(self, symbol: str, order_id: str) -> OrderUpdate:
+        """Fetch order status from Binance futures and convert to OrderUpdate.
+
+        Used as a post-trade confirmation when place_order returns ACK/NEW with 0 executed.
+        """
+        symbol_n = self._normalize_symbol(symbol)
+        data = await self._signed_request("GET", "/fapi/v1/order", {"symbol": symbol_n, "orderId": order_id})
+        status = str(data.get("status") or "NEW")
+        executed_qty = float(data.get("executedQty") or 0.0)
+        avg_price = float(data.get("avgPrice") or 0.0)
+        if avg_price == 0.0 and executed_qty > 0 and data.get("cumQuote") is not None:
+            try:
+                cum_quote = float(data.get("cumQuote") or 0.0)
+                avg_price = cum_quote / executed_qty if executed_qty else 0.0
+            except Exception:
+                pass
+
+        mapped_status = {
+            "NEW": "NEW",
+            "PARTIALLY_FILLED": "PARTIALLY_FILLED",
+            "FILLED": "FILLED",
+            "CANCELED": "CANCELED",
+            "REJECTED": "REJECTED",
+            "EXPIRED": "CANCELED",
+        }.get(status, status)
+
+        return OrderUpdate(
+            venue="binance_futures",
+            symbol=symbol,
+            order_id=str(data.get("orderId") or order_id),
+            client_order_id=str(data.get("clientOrderId") or "") or None,
+            status=mapped_status,
+            filled_qty=executed_qty,
+            avg_fill_price=avg_price if avg_price > 0 else None,
+            fee=None,
+            raw=data,
+        )
+
     async def get_last_price(self, symbol: str) -> float:
         symbol_n = self._normalize_symbol(symbol)
         data = await self._public_get("/fapi/v1/ticker/price", {"symbol": symbol_n})
@@ -129,9 +197,9 @@ class BinanceFuturesAdapter(BrokerAdapter):
 
     async def get_equity(self) -> float:
         data = await self._signed_request("GET", "/fapi/v2/account", {})
-        # totalWalletBalance is in USDT for USDT-margined futures; use it as equity proxy.
+        # totalMarginBalance includes unrealized PnL (closer to what users see as "equity").
         try:
-            return float(data.get("totalWalletBalance") or 0.0)
+            return float(data.get("totalMarginBalance") or data.get("totalWalletBalance") or 0.0)
         except Exception:
             return 0.0
 

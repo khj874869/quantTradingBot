@@ -148,6 +148,46 @@ class BinanceAdapter(BrokerAdapter):
                 out[asset] = qty
         return out
 
+    async def get_order_update(self, symbol: str, order_id: str) -> OrderUpdate:
+        """Fetch order status from Binance spot and convert to OrderUpdate.
+
+        Used as a post-trade confirmation when place_order returns an ACK/NEW response.
+        """
+        s = self._norm_symbol(symbol)
+        data = await self._signed("GET", "/api/v3/order", params={"symbol": s, "orderId": order_id})
+
+        status = (data.get("status") or "NEW").upper()
+        filled_qty = float(data.get("executedQty") or 0.0)
+        avg_price = None
+        cumm_quote = data.get("cummulativeQuoteQty")
+        if filled_qty > 0 and cumm_quote is not None:
+            try:
+                avg_price = float(cumm_quote) / filled_qty
+            except Exception:
+                avg_price = None
+
+        mapped_status = {
+            "NEW": "NEW",
+            "PARTIALLY_FILLED": "PARTIALLY_FILLED",
+            "FILLED": "FILLED",
+            "CANCELED": "CANCELED",
+            "REJECTED": "REJECTED",
+            "EXPIRED": "CANCELED",
+        }.get(status, status)
+
+        return OrderUpdate(
+            venue="binance",
+            order_id=str(data.get("orderId") or order_id),
+            client_order_id=str(data.get("clientOrderId") or "") or None,
+            symbol=symbol,
+            status=mapped_status,
+            filled_qty=filled_qty,
+            avg_fill_price=avg_price,
+            fee=None,
+            ts=utc_now(),
+            raw=data,
+        )
+
     @staticmethod
     def _fmt_qty(x: float) -> str:
         # Binance expects decimal string; avoid scientific notation.
