@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import asdict
 from typing import Optional, Sequence
 
@@ -15,14 +16,86 @@ class OrderExecutor:
     strategies can stay venue-agnostic.
     """
 
-    def __init__(self, adapter: BrokerAdapter, *, persist_orders: bool = False):
+    def __init__(
+        self,
+        adapter: BrokerAdapter,
+        *,
+        persist_orders: bool = False,
+        confirm_fills: bool = True,
+        confirm_max_attempts: int = 3,
+        confirm_base_sleep_sec: float = 0.15,
+    ):
         self.adapter = adapter
         self.persist_orders = persist_orders
+        self.confirm_fills = bool(confirm_fills)
+        self.confirm_max_attempts = int(confirm_max_attempts)
+        self.confirm_base_sleep_sec = float(confirm_base_sleep_sec)
+
+    async def _confirm_order_if_needed(self, req: OrderRequest, upd: OrderUpdate) -> OrderUpdate:
+        """Best-effort post-trade confirmation.
+
+        Some venues (notably Binance futures) may return an ACK/NEW response where executedQty is 0
+        even though the order is filled shortly after. That breaks journaling and position tracking.
+        If the adapter exposes `get_order_update`, we poll it a few times.
+        """
+        if not self.confirm_fills:
+            return upd
+
+        try:
+            if upd is None:
+                return upd
+            # Already has meaningful fill info or terminal status.
+            st = str(upd.status or "").upper()
+            if float(upd.filled_qty or 0.0) > 0.0 or st in {"FILLED", "CANCELED", "REJECTED"}:
+                return upd
+            if not (upd.order_id or "").strip():
+                return upd
+
+            getter = getattr(self.adapter, "get_order_update", None)
+            if getter is None or not callable(getter):
+                return upd
+
+            last = upd
+            for i in range(max(1, self.confirm_max_attempts)):
+                try:
+                    conf: OrderUpdate = await getter(req.symbol, str(upd.order_id))  # type: ignore[misc]
+                    if conf is not None:
+                        conf_st = str(conf.status or "").upper()
+                        conf_filled = float(conf.filled_qty or 0.0)
+                        # Return as soon as we have a meaningful update.
+                        if conf_filled > 0.0 or conf_st in {"FILLED", "CANCELED", "REJECTED", "PARTIALLY_FILLED"}:
+                            merged_raw = {
+                                "confirm_source": "get_order_update",
+                                "confirm_attempts": i + 1,
+                                "initial": (upd.raw or {}),
+                                "confirmed": (conf.raw or {}),
+                            }
+                            return OrderUpdate(
+                                venue=conf.venue,
+                                order_id=conf.order_id,
+                                symbol=req.symbol,
+                                status=conf.status,
+                                filled_qty=conf.filled_qty,
+                                avg_fill_price=conf.avg_fill_price,
+                                fee=conf.fee,
+                                client_order_id=conf.client_order_id or upd.client_order_id,
+                                ts=conf.ts,
+                                raw=merged_raw,
+                            )
+                        last = conf
+                except Exception:
+                    pass
+                await asyncio.sleep(self.confirm_base_sleep_sec * (1.0 + 0.75 * i))
+            # No confirmation; keep original.
+            return upd
+        except Exception:
+            return upd
 
     async def execute(self, req: OrderRequest) -> ExecutionResult:
         """Execute a single order request, converting exceptions into REJECTED."""
         try:
             upd = await self.adapter.place_order(req)
+            upd = await self._confirm_order_if_needed(req, upd)
             return ExecutionResult(req=req, update=upd)
         except Exception as e:
             upd = OrderUpdate(

@@ -557,6 +557,15 @@ async def run_live(cfg: LiveConfig) -> None:
     # In paper mode we always "trade". In live mode, TRADING_ENABLED acts as a kill-switch.
     trading_enabled = bool(cfg.mode != "live" or settings.TRADING_ENABLED)
 
+    # ---- Loud runtime banner (prevents "I thought it was live" accidents) ----
+    if cfg.mode != "live":
+        console.print("[bold yellow]PAPER MODE[/bold yellow] - 실주문 전송 안 함 (바이낸스 앱에 체결이 안 보이는 게 정상).")
+    else:
+        if settings.TRADING_ENABLED:
+            console.print("[bold green]LIVE MODE[/bold green] - 실주문 전송 [bold green]ON[/bold green] (TRADING_ENABLED=true)")
+        else:
+            console.print("[bold red]LIVE MODE[/bold red] - 실주문 전송 [bold red]OFF[/bold red] (TRADING_ENABLED=false → DRYRUN)")
+
     adapter = _make_adapter(cfg)
     executor = OrderExecutor(adapter)
 
@@ -632,6 +641,9 @@ async def run_live(cfg: LiveConfig) -> None:
                         "ts_ms": now_ms,
                         "venue": venue,
                         "account_tag": acct_tag,
+                        "mode": cfg.mode,
+                        "strategy": cfg.strategy,
+                        "simulated": bool(cfg.mode != "live"),
                         "equity": float(equity),
                     })
                 except Exception:
@@ -763,11 +775,16 @@ async def run_live(cfg: LiveConfig) -> None:
                                 "ts": ts.isoformat(),
                                 "venue": venue,
                                 "account_tag": acct_tag,
+                                "mode": cfg.mode,
+                                "simulated": bool(cfg.mode != "live"),
                                 "symbol": symbol,
                                 "side": close_side,
                                 "qty": filled_qty,
                                 "price": fill_px,
                                 "fee": fee,
+                                "order_id": str(res.update.order_id or ""),
+                                "client_order_id": str(res.update.client_order_id or ""),
+                                "order_status": str(res.update.status or ""),
                                 "reason": decision.reason,
                                 "realized_gross_delta": realized.get("realized_pnl_delta", 0.0),
                                 "realized_net_delta": realized.get("realized_pnl_net_delta", 0.0),
@@ -896,11 +913,16 @@ async def run_live(cfg: LiveConfig) -> None:
                                         "ts": ts.isoformat(),
                                         "venue": venue,
                                         "account_tag": acct_tag,
+                                        "mode": cfg.mode,
+                                        "simulated": bool(cfg.mode != "live"),
                                         "symbol": symbol,
                                         "side": side,
                                         "qty": filled_qty,
                                         "price": fill_px,
                                         "fee": fee,
+                                        "order_id": str(res.update.order_id or ""),
+                                        "client_order_id": str(res.update.client_order_id or ""),
+                                        "order_status": str(res.update.status or ""),
                                         "reason": "ENTRY",
                                         "signal": {"side": sig.side, "score": sig.score, "meta": sig.meta},
                                     }
