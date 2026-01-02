@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
+
 from rich.console import Console
 from rich.table import Table
 
@@ -78,7 +80,42 @@ async def run_demo():
     # 6) Risk + execute
     adapter = DemoAdapter()
     adapter.set_price(symbol, float(df_15["close"].iloc[-1]))
-    executor = OrderExecutor(adapter, venue=venue, trading_enabled=True)
+   
+    params = inspect.signature(OrderExecutor).parameters
+
+    kwargs = {}
+    # 어떤 버전은 venue를 받음
+    if "venue" in params:
+        kwargs["venue"] = venue
+
+    # 어떤 버전은 trading_enabled 또는 enabled를 받음
+    if "trading_enabled" in params:
+        kwargs["trading_enabled"] = True
+    elif "enabled" in params:
+        kwargs["enabled"] = True
+
+    # ✅ 생성 (kwargs 비어있으면 adapter만)
+    executor = OrderExecutor(adapter, **kwargs) if kwargs else OrderExecutor(adapter)
+
+    # ✅ 생성자에서 못 받는 버전이면 속성으로라도 세팅(있을 때만)
+    for attr in ("trading_enabled", "enabled"):
+        if hasattr(executor, attr):
+            try:
+                setattr(executor, attr, True)
+            except Exception:
+                pass
+
+    if hasattr(executor, "venue"):
+        try:
+            executor.venue = venue
+        except Exception:
+            pass
+
+
+
+
+
+
     rm = RiskManager()
 
     equity = await adapter.get_equity()

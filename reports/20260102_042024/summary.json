@@ -1,0 +1,25 @@
+{
+  "window_days": 30,
+  "since_utc": "2025-12-03T04:20:24.877586+00:00",
+  "until_utc": "2026-01-02T04:20:24.877586+00:00",
+  "filters": {
+    "account_tag": null,
+    "venue": null,
+    "symbol": null
+  },
+  "fills_count": 0,
+  "realized_trades_count": 0,
+  "pnl_net": 0,
+  "pnl_gross": 0,
+  "fees_total": 0,
+  "win_rate": 0.0,
+  "avg_win_net": 0.0,
+  "avg_loss_net": 0.0,
+  "profit_factor": 0.0,
+  "max_consecutive_losses": 0,
+  "avg_holding_sec": 0.0,
+  "max_drawdown_frac": 0.0,
+  "mdd_peak_utc": "2026-01-02T03:40:11.857000+00:00",
+  "mdd_trough_utc": null,
+  "return_frac_from_equity": 0.0
+}

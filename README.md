@@ -66,8 +66,17 @@ python -m quantbot.main --mode paper --venue upbit   --strategy scalp   --symbol
 ```
 ### binance(paper scalp)
 ```bash
-py -m quantbot.main --mode paper --venue binance   --strategy scalp   --symbols BTC   --entry-tf 1m --poll-sec 5   --take-profit-net-pct 0.0039 --leverage 10   --scalp-min-1m-trade-value 50000000   --scalp-min-orderbook-notional 100000000   --paper-cash 1000000 --paper-fee-bps 10 --paper-slippage-bps 5
+py -m quantbot.main --mode paper --venue binance   --strategy scalp   --symbols BTC   --entry-tf 1m --poll-sec 5   --take-profit-net-pct 0.0039 --leverage 10   --scalp-min-1m-trade-value 50000000   --scalp-min-orderbook-notional 100000000   --paper-cash 1000000 --paper-fee-bps 10 --paper-slippage-bps 5 
+###선물
+py -m quantbot.main --mode paper --venue binance_futures --strategy scalp `
+  --symbols BTCUSDT --entry-tf 1m --poll-sec 5 `
+  --take-profit-net-pct 0.0039 --leverage 10 `
+  --scalp-min-1m-trade-value 50000000 --scalp-min-orderbook-notional 100000000 `
+  --paper-cash 1000000 --paper-fee-bps 10 --paper-slippage-bps 5
+  py -m quantbot.main --mode live --venue binance_futures --strategy scalp --symbols BTCUSDT --entry-tf 1m --poll-sec 5
+
 ```
+
 ## Live usage examples
 
 ### Upbit
