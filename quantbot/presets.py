@@ -52,6 +52,35 @@ BUILTIN: Dict[str, Dict[str, Any]] = {
         "max_total_exposure_frac": 0.60,
     },
 
+# Binance Futures: small-account ETH scalp (lower min notional vs BTC on many accounts).
+"binance_futures_eth_scalp_small": {
+    "poll_sec": 5,
+    "entry_tf": "1m",
+    "leverage": 10.0,
+    "order_sizing_mode": "equity_pct",
+    "trade_equity_frac": 0.2,
+    "min_notional_policy": "auto",
+    "min_notional_buffer": 1.02,
+    "take_profit_net_pct": 0.0039,
+    "scalp_use_ws_trades": True,
+    "scalp_use_liquidation_stream": True,
+    "scalp_flow_window_sec": 5,
+    "scalp_pressure_window_sec": 15,
+    "scalp_rsi_long_trigger": 40.0,
+    "scalp_rsi_short_min": 65.0,
+    "scalp_rsi_short_max": 70.0,
+    "scalp_imbalance_threshold": 0.15,
+    "scalp_trade_pressure_threshold": 0.20,
+    "scalp_max_spread_bps": 10.0,
+    "entry_use_ioc": True,
+    "exit_use_ioc": True,
+    "ioc_price_pad_bps": 2.0,
+    "ioc_max_chase_bps": 12.0,
+    "max_account_exposure_frac": 0.25,
+    "max_total_exposure_frac": 0.45,
+},
+
+
     # Upbit spot: no short; lower aggressiveness; KRW quote.
     "upbit_btc_scalp": {
         "poll_sec": 5,

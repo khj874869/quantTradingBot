@@ -36,6 +36,21 @@ from quantbot.utils.time import utc_now
 console = Console()
 
 
+def _print_httpx_error(prefix: str, e: Exception) -> None:
+    """Pretty-print httpx HTTP errors with response body (Binance often provides code/msg in JSON)."""
+    if isinstance(e, httpx.HTTPStatusError):
+        resp = e.response
+        console.print(f"[red]{prefix}[/red]: HTTP {resp.status_code} {resp.reason_phrase}")
+        try:
+            console.print_json(data=resp.json())
+        except Exception:
+            txt = (resp.text or "").strip()
+            if txt:
+                console.print(txt)
+        return
+    console.print(f"[red]{prefix}[/red]: {e}")
+
+
 async def _server_time_ms(venue: str, settings) -> int | None:
     try:
         if venue == "binance":
@@ -109,16 +124,25 @@ async def run(args) -> int:
     try:
         px = await adapter.get_last_price(args.symbol)
     except Exception as e:
-        console.print(f"[red]get_last_price failed[/red]: {e}")
+        _print_httpx_error("get_last_price failed", e)
         return 2
 
     try:
         equity = await adapter.get_equity()
     except Exception as e:
-        console.print(f"[red]get_equity failed[/red]: {e}")
+        _print_httpx_error("get_equity failed", e)
         return 2
 
     console.print(f"[green]OK[/green] last_price={px} equity={equity}")
+
+
+    # Symbol rules (best-effort)
+    if venue == "binance_futures":
+        try:
+            rules = await adapter.get_symbol_rules(args.symbol, order_type=str(args.order_type).upper())
+            console.print("[dim]SYMBOL RULES[/dim] " + f"step={rules.qty_step} min_qty={rules.min_qty} min_notional={rules.min_notional}")
+        except Exception:
+            pass
 
     if not args.do_order:
         return 0
@@ -134,7 +158,7 @@ async def run(args) -> int:
             await adapter.set_leverage(args.symbol, int(args.leverage))
             console.print(f"[cyan]Set leverage[/cyan] {args.symbol} -> {int(args.leverage)}x")
         except Exception as e:
-            console.print(f"[red]set_leverage failed[/red]: {e}")
+            _print_httpx_error("set_leverage failed", e)
             return 2
 
     meta: Dict[str, Any] = {}

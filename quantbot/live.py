@@ -115,7 +115,14 @@ class LiveConfig:
     poll_sec: int = 5
 
     # order sizing
-    intended_notional: float = 100_000.0
+    intended_notional: float = 100_000.0  # used when order_sizing_mode='fixed'
+    order_sizing_mode: str = settings.SCALP_ORDER_SIZING_MODE  # fixed | equity_pct
+    trade_equity_frac: float = settings.SCALP_TRADE_EQUITY_FRAC
+    min_notional_policy: str = settings.SCALP_MIN_NOTIONAL_POLICY  # skip | bump | auto
+    min_notional_buffer: float = settings.SCALP_MIN_NOTIONAL_BUFFER
+    auto_bump_max_over_notional_frac: float = settings.SCALP_AUTO_BUMP_MAX_OVER_NOTIONAL_FRAC
+    auto_bump_max_equity_frac: float = settings.SCALP_AUTO_BUMP_MAX_EQUITY_FRAC
+    auto_bump_max_over_margin_frac: float = settings.SCALP_AUTO_BUMP_MAX_OVER_MARGIN_FRAC
 
     # exits
     stop_loss_pct: float = settings.STOP_LOSS_PCT
@@ -211,6 +218,125 @@ def _best_bid_ask(venue: str, ob_raw: Any) -> Tuple[Optional[float], Optional[fl
     except Exception:
         return None, None
     return None, None
+
+
+
+def _compute_intended_notional(
+    *,
+    venue: str,
+    equity: float,
+    last_price: float,
+    cfg: LiveConfig,
+) -> float:
+    """Compute intended notional (quote currency) for an entry."""
+    mode = str(getattr(cfg, "order_sizing_mode", "fixed") or "fixed").lower()
+    if mode == "equity_pct":
+        frac = float(getattr(cfg, "trade_equity_frac", 0.0) or 0.0)
+        frac = max(0.0, min(1.0, frac))
+        margin_budget = max(0.0, equity) * frac
+        if str(venue).lower() in {"binance_futures"}:
+            return margin_budget * float(getattr(cfg, "leverage", 1.0) or 1.0)
+        return margin_budget
+    return float(getattr(cfg, "intended_notional", 0.0) or 0.0)
+
+
+async def _adjust_qty_by_rules(
+    *,
+    adapter: Any,
+    venue: str,
+    symbol: str,
+    order_type: str,
+    last_price: float,
+    qty: float,
+    equity: float,
+    intended_notional: float,
+    cfg: LiveConfig,
+    console: Console,
+) -> tuple[float, float, str | None]:
+    """Return (qty_adj, notional_adj, reason_if_skipped).
+
+    Uses adapter.get_symbol_rules when available (Binance futures) to:
+      - floor to stepSize
+      - enforce minQty
+      - enforce minNotional (skip or bump)
+    """
+    qty = float(qty or 0.0)
+    if qty <= 0 or last_price <= 0:
+        return 0.0, 0.0, "BAD_QTY_OR_PRICE"
+
+    # Default: no rules
+    rules = None
+    if hasattr(adapter, "get_symbol_rules"):
+        try:
+            rules = await adapter.get_symbol_rules(symbol, order_type=str(order_type).upper())
+        except Exception:
+            rules = None
+
+    qty_adj = qty
+    if rules is not None and getattr(rules, "qty_step", 0.0):
+        step = float(getattr(rules, "qty_step", 0.0) or 0.0)
+        if step > 0:
+            qty_adj = math.floor(qty_adj / step) * step
+
+    if rules is not None:
+        min_qty = float(getattr(rules, "min_qty", 0.0) or 0.0)
+        if min_qty > 0 and qty_adj < min_qty:
+            qty_adj = min_qty
+
+    notional_adj = qty_adj * last_price
+
+    # Enforce min notional if known
+    if rules is not None and getattr(rules, "min_notional", None):
+        min_notional = float(getattr(rules, "min_notional") or 0.0)
+        if min_notional > 0 and notional_adj < min_notional:
+            policy = str(getattr(cfg, "min_notional_policy", "skip") or "skip").lower()
+            if policy in ("bump", "auto"):
+                buf = float(getattr(cfg, "min_notional_buffer", 1.0) or 1.0)
+                target = min_notional * max(1.0, buf)
+                if policy == "auto":
+                    # AUTO decision: bump only if doing so stays within risk-safe margin caps.
+                    # - Cap A: required margin <= intended_margin * (1 + auto_bump_max_over_margin_frac)
+                    # - Cap B: required margin <= equity * auto_bump_max_equity_frac
+                    lev = float(getattr(cfg, "leverage", 1.0) or 1.0)
+                    lev = max(1e-9, lev)
+                    intended_margin = float(intended_notional) / lev
+                    req_margin = target / lev
+                    max_over_margin = float(getattr(cfg, "auto_bump_max_over_margin_frac", 0.5) or 0.5)
+                    max_equity_frac = float(getattr(cfg, "auto_bump_max_equity_frac", 0.30) or 0.30)
+                    cap_margin = intended_margin * (1.0 + max(0.0, max_over_margin))
+                    cap_equity = (float(equity) * max(0.0, max_equity_frac)) if max_equity_frac > 0 else float("inf")
+                    if intended_margin <= 0:
+                        return 0.0, 0.0, f"MIN_NOTIONAL<{min_notional:g}_AUTO_SKIP(no_margin_budget)"
+                    if req_margin > cap_margin or req_margin > cap_equity:
+                        return 0.0, 0.0, (
+                            f"MIN_NOTIONAL<{min_notional:g}_AUTO_SKIP("
+                            f"req_margin={req_margin:.4g} cap_margin={cap_margin:.4g} cap_equity={cap_equity:.4g}"
+                            f")"
+                        )
+                step = float(getattr(rules, "qty_step", 0.0) or 0.0)
+                qty_needed = target / max(1e-12, last_price)
+                if step > 0:
+                    qty_adj = math.ceil(qty_needed / step) * step
+                else:
+                    qty_adj = qty_needed
+                # enforce min qty again
+                min_qty = float(getattr(rules, "min_qty", 0.0) or 0.0)
+                if min_qty > 0 and qty_adj < min_qty:
+                    qty_adj = min_qty
+                notional_adj = qty_adj * last_price
+                console.print(f"[dim]MIN_NOTIONAL bump qty -> {qty_adj:g} (target_notional≈{target:g}, policy={policy})[/dim]")
+            else:
+                return 0.0, 0.0, f"MIN_NOTIONAL<{min_notional:g}"
+
+    if rules is not None:
+        max_qty = float(getattr(rules, "max_qty", 0.0) or 0.0)
+        if max_qty > 0 and qty_adj > max_qty:
+            return 0.0, 0.0, "QTY_ABOVE_MAX"
+
+    if qty_adj <= 0:
+        return 0.0, 0.0, "QTY_ADJ_LE0"
+
+    return qty_adj, notional_adj, None
 
 
 def _orderbook_l2(venue: str, ob_raw: Any, depth: int = 10) -> Optional[dict]:
@@ -839,6 +965,32 @@ async def run_live(cfg: LiveConfig) -> None:
                         sig = None
 
                     if sig is not None and sig.side in {"BUY", "SELL"}:
+                        # Sizing (compute intended notional and adjust qty to exchange rules)
+                        intended_notional = _compute_intended_notional(
+                            venue=venue,
+                            equity=float(equity or 0.0),
+                            last_price=float(last_price or 0.0),
+                            cfg=cfg,
+                        )
+                        qty_raw = intended_notional / max(1e-12, last_price)
+                        intended_notional_raw = float(intended_notional)
+                        qty, intended_notional_adj, skip_reason = await _adjust_qty_by_rules(
+                            adapter=adapter,
+                            venue=venue,
+                            symbol=symbol,
+                            order_type="MARKET",
+                            last_price=float(last_price),
+                            qty=float(qty_raw),
+                            equity=float(equity or 0.0),
+                            intended_notional=float(intended_notional_raw),
+                            cfg=cfg,
+                            console=console,
+                        )
+                        if skip_reason:
+                            console.print(f"[dim]SKIP[/dim] {symbol} sizing: {skip_reason}")
+                            continue
+                        intended_notional = float(intended_notional_adj)
+
                         # Risk
                         prices = {symbol: last_price}
                         pf = PortfolioState(
@@ -850,7 +1002,7 @@ async def run_live(cfg: LiveConfig) -> None:
                         ok, why = rm.approve(
                             pf,
                             sig,
-                            intended_notional=cfg.intended_notional,
+                            intended_notional=intended_notional,
                             venue=venue,
                             global_store=global_store,
                             account_tag=acct_tag,
@@ -863,8 +1015,6 @@ async def run_live(cfg: LiveConfig) -> None:
                             console.print(f"[dim]SKIP[/dim] {symbol} risk: {why}")
                         else:
                             side = sig.side
-                            qty = cfg.intended_notional / max(1e-12, last_price)
-
                             use_ioc = bool(cfg.entry_use_ioc and _venue_supports_ioc(venue) and best_bid and best_ask)
                             hint_px = None
                             try:

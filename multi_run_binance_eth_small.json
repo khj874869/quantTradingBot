@@ -1,0 +1,16 @@
+{
+  "python": ".venv\\Scripts\\python.exe",
+  "bots": [
+    {
+      "mode": "live",
+      "venue": "binance_futures",
+      "strategy": "scalp",
+      "symbols": [
+        "ETHUSDT"
+      ],
+      "preset": "binance_futures_eth_scalp_small",
+      "account_tag": "binance_small",
+      "poll_sec": 5
+    }
+  ]
+}

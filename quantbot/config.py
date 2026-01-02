@@ -43,6 +43,22 @@ class Settings(BaseSettings):
     # Scalping defaults (strategy='scalp')
     SCALP_TP_NET_PCT: float = 0.0039  # 0.39% (net of fees) at 1x; at 10x -> ~3.9% equity return
     SCALP_LEVERAGE: float = 1.0
+    # Order sizing
+    # - fixed: use LiveConfig.intended_notional
+    # - equity_pct: use (equity * SCALP_TRADE_EQUITY_FRAC) as margin budget; notional = margin*leverage on futures
+    SCALP_ORDER_SIZING_MODE: str = "fixed"  # fixed | equity_pct
+    SCALP_TRADE_EQUITY_FRAC: float = 0.2  # fraction of wallet balance to allocate as margin per entry
+    SCALP_MIN_NOTIONAL_POLICY: str = "auto"  # skip | bump | auto
+    SCALP_MIN_NOTIONAL_BUFFER: float = 1.01  # bump target = min_notional * buffer
+    # When SCALP_MIN_NOTIONAL_POLICY="auto": allow bump only if required notional is within (1 + frac) of intended notional
+    SCALP_AUTO_BUMP_MAX_OVER_NOTIONAL_FRAC: float = 0.25
+
+    # (AUTO v2) Additional safety caps for bump decisions
+    # - If bumping to min_notional would require using more than this fraction of equity as margin, skip.
+    SCALP_AUTO_BUMP_MAX_EQUITY_FRAC: float = 0.30
+    # - If bumping would require more than (1 + frac) of the intended margin budget, skip.
+    SCALP_AUTO_BUMP_MAX_OVER_MARGIN_FRAC: float = 0.50
+
     SCALP_MIN_1M_TRADE_VALUE: float = 0.0
     SCALP_MIN_ORDERBOOK_NOTIONAL: float = 0.0
     SCALP_IMBALANCE_THRESHOLD: float = 0.15
