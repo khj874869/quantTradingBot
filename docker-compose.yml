@@ -27,7 +27,7 @@ services:
       --symbols ${BOT_SYMBOLS:-DEMOCOIN-KRW}
       --entry-tf ${BOT_ENTRY_TF:-15m}
       --poll-sec ${BOT_POLL_SEC:-30}
-      --news-feeds ${BOT_NEWS_FEEDS:-}
+      --news-feeds "${BOT_NEWS_FEEDS:-}"
       --notional ${BOT_NOTIONAL:-100000}
 
 volumes:

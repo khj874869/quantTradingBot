@@ -372,7 +372,24 @@ def main():
         cfg.entry_use_ioc = bool(args.entry_use_ioc)
     if args.exit_use_ioc is not None:
         cfg.exit_use_ioc = bool(args.exit_use_ioc)
-    asyncio.run(run_live(cfg))
+    # Keep the bot alive: if the live loop crashes due to transient network/rate-limit issues,
+    # auto-restart with exponential backoff (Ctrl+C to stop).
+    import time as _time
+    import traceback as _traceback
+
+    backoff_sec = 1.0
+    while True:
+        try:
+            asyncio.run(run_live(cfg))
+            return
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            print(f"[FATAL] run_live crashed: {e}")
+            _traceback.print_exc()
+            _time.sleep(min(30.0, backoff_sec))
+            backoff_sec = min(30.0, backoff_sec * 2.0)
+
 
 
 if __name__ == "__main__":
