@@ -15,7 +15,7 @@ from rich.console import Console
 from quantbot.config import get_settings
 from quantbot.utils.time import utc_now
 from quantbot.collectors.upbit_rest import fetch_upbit_candles, fetch_upbit_orderbook
-from quantbot.collectors.binance_rest import fetch_binance_klines, fetch_binance_orderbook
+from quantbot.collectors.binance_rest import fetch_binance_klines, fetch_binance_klines_latest, fetch_binance_orderbook
 from quantbot.collectors.store import upsert_candles, load_candles_df
 from quantbot.bar_builder.resampler import resample_ohlcv, RULE_MAP
 from quantbot.features.indicators import add_indicators
@@ -447,7 +447,7 @@ async def _adjust_qty_by_rules(
             bumped = True
 
             console.print(
-                f"[dim]SIZING[/dim] {symbol} minNotional bump -> qty={qty_adj:g} notional≈{notional_adj:.4g} target≈{bump_target:.4g} policy={policy}"
+                f"[dim]SIZING[/dim] {symbol} minNotional bump -> qty={qty_adj:g} notional~{notional_adj:.4g} target~{bump_target:.4g} policy={policy}"
             )
         else:
             return commit(
@@ -498,7 +498,7 @@ async def _adjust_qty_by_rules(
     # One-line summary (helps in live console)
     try:
         console.print(
-            f"[dim]SIZING[/dim] {symbol} qty={qty_adj:g} notional≈{notional_adj:.4g} (in={qty_in:g}, px={px:.4g}) decision={decision}"
+            f"[dim]SIZING[/dim] {symbol} qty={qty_adj:g} notional~{notional_adj:.4g} (in={qty_in:g}, px={px:.4g}) decision={decision}"
         )
     except Exception:
         pass
@@ -779,46 +779,23 @@ async def _call(fn, *args, **kwargs):
 async def _fetch_1m_candles(venue: str, symbol: str, limit: int = 400):
     # Upbit candles (REST)
     if venue == "upbit":
-        return await _call(fetch_upbit_candles, symbol, minutes=1, count=min(int(limit), 200))
+        return await _call(fetch_upbit_candles, symbol, "1m", total=min(int(limit), 200))
 
     # Binance spot / futures candles (REST)
     if venue in ("binance", "binance_futures"):
-        base = {"symbol": symbol, "interval": "1m"}
-        limit_keys = ("limit", "count", "n", "size", "max_records", "maxRows")
-        flags = ("futures", "is_futures", "futures_mode") if venue == "binance_futures" else (None,)
-        for lk in limit_keys:
-            for fk in flags:
-                kw = dict(base)
-                kw[lk] = int(limit)
-                try:
-                    if fk:
-                        return await _call(fetch_binance_klines, **kw, **{fk: True})
-                    return await _call(fetch_binance_klines, **kw)
-                except TypeError as e:
-                    msg = str(e)
-                    if "unexpected keyword argument" in msg and (f"\'{lk}\'" in msg or (fk and f"\'{fk}\'" in msg)):
-                        continue
-                    raise
-        # Fallback: try without limit kw (collector might have a default)
-        for fk in flags:
-            try:
-                if fk:
-                    return await _call(fetch_binance_klines, symbol=symbol, interval="1m", **{fk: True})
-                return await _call(fetch_binance_klines, symbol=symbol, interval="1m")
-            except TypeError as e:
-                msg = str(e)
-                if "unexpected keyword argument" in msg and fk and f"\'{fk}\'" in msg:
-                    continue
-                # maybe expects positional args
-                try:
-                    return await _call(fetch_binance_klines, symbol, "1m", int(limit))
-                except TypeError:
-                    return await _call(fetch_binance_klines, symbol, "1m")
+        is_futures = venue == "binance_futures"
+        base_url = settings.BINANCE_FUTURES_BASE_URL if is_futures else settings.BINANCE_BASE_URL
+        return await _call(
+            fetch_binance_klines_latest,
+            symbol=symbol,
+            interval="1m",
+            limit=int(limit),
+            futures=is_futures,
+            base_url=base_url,
+        )
 
     # Other venues: candles are built elsewhere (e.g., SimpleMinuteBarBuilder for stocks)
     return None
-
-
 async def _fetch_orderbook(venue: str, symbol: str, adapter: Optional[Any] = None) -> Optional[dict]:
     if venue == "upbit":
         return await _call(fetch_upbit_orderbook, symbol)
@@ -965,6 +942,24 @@ def _candles_for_ui(df_1m, limit: int = 240) -> list[dict]:
         return []
 
 
+def _merge_candles(old_df, new_df, *, keep: int = 600):
+    """Merge candle DataFrames by index (ts) and keep only the most recent rows."""
+    try:
+        if old_df is None or getattr(old_df, "empty", False):
+            return new_df
+        if new_df is None or getattr(new_df, "empty", False):
+            return old_df
+        import pandas as _pd
+
+        df = _pd.concat([old_df, new_df]).sort_index()
+        df = df[~df.index.duplicated(keep="last")]
+        if keep and keep > 0:
+            df = df.tail(int(keep))
+        return df
+    except Exception:
+        return old_df if old_df is not None else new_df
+
+
 def _make_adapter(cfg: LiveConfig):
     venue = cfg.venue
     if cfg.mode == "paper":
@@ -1085,6 +1080,16 @@ async def run_live(cfg: LiveConfig) -> None:
     #depth=cfg.scalp_ob_delta_depth
     liq_cluster = LiquidationClusterBook(window_sec=cfg.scalp_liq_window_sec, bucket_bps=cfg.scalp_liq_bucket_bps)
 
+    # Candle cache: avoid refetching hundreds of bars every poll.
+    candle_cache: dict[str, Any] = {}
+    candle_last_fetch_ms: dict[str, int] = {}
+    # Candle fetch backoff (prevents hammering REST when rate-limited / flaky).
+    candle_backoff_until_ms: dict[str, int] = {}
+    candle_fail_count: dict[str, int] = {}
+    candle_keep_limit: int = 600
+    candle_full_refresh_every_ms: int = 5 * 60 * 1000  # force refresh every 5 minutes (safety)
+    candle_incremental_limit: int = 60  # last N bars per poll for incremental merge
+
     # Background streams (non-blocking)
     stop_ws: Optional[asyncio.Event] = None
     stop_liq: Optional[asyncio.Event] = None
@@ -1142,6 +1147,7 @@ async def run_live(cfg: LiveConfig) -> None:
 
             for symbol in cfg.symbols:
                 # Market data
+                candle_fresh = True
                 if venue in stock_venues:
                     try:
                         px = float(await adapter.get_last_price(symbol))
@@ -1151,7 +1157,51 @@ async def run_live(cfg: LiveConfig) -> None:
                         bar_builders[symbol].update(ts, px, 0.0)
                     df_1m = bar_builders[symbol].dataframe(limit=400) if symbol in bar_builders else None
                 else:
-                    df_1m = await _fetch_1m_candles(venue, symbol, limit=400)
+                    # Use cached candles to reduce REST load and avoid rate limiting.
+                    # If fetching fails (429/network/etc), back off per-symbol and keep trading using
+                    # orderbook/ticker as mark price so exits still work.
+                    cached = candle_cache.get(symbol)
+                    last_fetch = int(candle_last_fetch_ms.get(symbol, 0) or 0)
+                    need_full = (cached is None) or (now_ms - last_fetch > candle_full_refresh_every_ms) or (len(cached) < 60)
+                    candle_fresh = False
+                    backoff_until = int(candle_backoff_until_ms.get(symbol, 0) or 0)
+
+                    if cached is not None and now_ms < backoff_until:
+                        df_1m = cached
+                    else:
+                        df_1m = None
+                        last_err: Exception | None = None
+                        for i in range(3):
+                            try:
+                                if need_full:
+                                    df_1m_new = await _fetch_1m_candles(venue, symbol, limit=400)
+                                    df_1m = df_1m_new
+                                else:
+                                    df_1m_new = await _fetch_1m_candles(venue, symbol, limit=candle_incremental_limit)
+                                    df_1m = _merge_candles(cached, df_1m_new, keep=candle_keep_limit)
+                                last_err = None
+                                break
+                            except Exception as e:
+                                last_err = e
+                                await asyncio.sleep(0.35 * (2 ** i))
+
+                        if last_err is None and df_1m is not None:
+                            candle_cache[symbol] = df_1m
+                            candle_last_fetch_ms[symbol] = now_ms
+                            candle_fail_count[symbol] = 0
+                            candle_backoff_until_ms[symbol] = 0
+                            candle_fresh = True
+                        else:
+                            if last_err is not None:
+                                console.print(f"[red]CANDLE_FETCH_FAIL[/red] {symbol} {type(last_err).__name__}: {last_err}")
+                            df_1m = cached
+
+                            # Per-symbol backoff to avoid hammering REST when failing.
+                            fc = int(candle_fail_count.get(symbol, 0) or 0) + 1
+                            candle_fail_count[symbol] = fc
+                            cooldown_ms = int(min(60_000, 2_000 * (2 ** min(fc, 5))))
+                            candle_backoff_until_ms[symbol] = now_ms + cooldown_ms
+
                 if df_1m is None or len(df_1m) < 60:
                     continue
 
@@ -1164,13 +1214,31 @@ async def run_live(cfg: LiveConfig) -> None:
 
                 df_1m = add_indicators(df_1m)
                 last_row = df_1m.iloc[-1]
-                last_price = float(last_row["close"])
-                tracker.update_mark(symbol, last_price)
+                candle_close = float(last_row["close"])
 
                 # Orderbook
                 ob_raw = await _fetch_orderbook(venue, symbol, adapter)
                 best_bid, best_ask = _best_bid_ask(venue, ob_raw)
                 ob_l2 = _orderbook_l2(venue, ob_raw, depth=10)
+
+                # Mark price: prefer orderbook mid (more up-to-date than 1m close).
+                last_price = candle_close
+                try:
+                    if best_bid is not None and best_ask is not None and float(best_bid) > 0 and float(best_ask) > 0:
+                        last_price = (float(best_bid) + float(best_ask)) * 0.5
+                except Exception:
+                    last_price = candle_close
+
+                # If candles are stale and we couldn't get a usable orderbook mid, try ticker.
+                if (not candle_fresh) and (last_price == candle_close or last_price <= 0):
+                    try:
+                        px_now = float(await adapter.get_last_price(symbol))
+                    except Exception:
+                        px_now = 0.0
+                    if px_now > 0:
+                        last_price = px_now
+
+                tracker.update_mark(symbol, float(last_price))
                 # Microstructure features
                 ob_imb = orderbook_imbalance_score(ob_raw) if ob_raw is not None else 0.0
                 ob_imb_delta = 0.0
@@ -1188,6 +1256,32 @@ async def run_live(cfg: LiveConfig) -> None:
                 trade_pressure_notional = float(ps.notional)
                 fs = flow.snapshot(symbol, now_ms)
                 flow_dict = asdict(fs)
+                # If WS trade stream goes stale, strict pressure/flow filters can block all entries.
+                # Fallback: temporarily disable stream-dependent thresholds for this iteration.
+                ws_stale = False
+                try:
+                    st = float(getattr(ps, "staleness_sec", 0.0) or 0.0)
+                    ws_stale = bool(cfg.scalp_use_ws_trades) and (st > float(cfg.scalp_ws_staleness_sec or 0))
+                except Exception:
+                    ws_stale = False
+
+                # NOTE: params must be defined *before* any fallback logic.
+                # We build params per-iteration (cheap) so hot-reloads of env/preset overrides take effect.
+                params_eff: Optional[ScalpingParams] = None
+                if cfg.strategy == "scalp":
+                    params_base = _mk_scalp_params(cfg)
+                    params_eff = params_base
+                    if ws_stale:
+                        try:
+                            params_eff = ScalpingParams(**asdict(params_base))
+                            params_eff.trade_pressure_threshold = 0.0
+                            params_eff.min_trade_pressure_notional = 0.0
+                            params_eff.min_flow_notional_rate = 0.0
+                            params_eff.min_flow_accel = 0.0
+                            params_eff.min_large_trade_share = 0.0
+                            params_eff.min_trade_count = 0
+                        except Exception:
+                            params_eff = params_base
                 recent_trades = []
                 try:
                     recent_trades = flow.recent_trades(symbol, limit=60, now_ms=now_ms, max_age_sec=120.0)
@@ -1315,7 +1409,7 @@ async def run_live(cfg: LiveConfig) -> None:
                             orderbook_imbalance_delta=float(ob_imb_delta),
                             trade_pressure=float(trade_pressure),
                             trade_pressure_notional=float(trade_pressure_notional),
-                            params=params,
+                            params=params_eff,
                             in_position=False,
                             flow=flow_dict,
                             liq=liq_dict,
