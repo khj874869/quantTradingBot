@@ -16,19 +16,54 @@ BASE_URL_FUTURES = "https://fapi.binance.com"
 _client_spot: Optional[httpx.AsyncClient] = None
 _client_futures: Optional[httpx.AsyncClient] = None
 
+# AsyncClient instances are bound to the event loop they were created in.
+# If the bot restarts its asyncio loop (e.g. after a crash + auto-restart),
+# a previously created client can throw "Event loop is closed" on Windows.
+# We track the creating loop id and recreate the client when the loop changes.
+_client_spot_loop_id: Optional[int] = None
+_client_futures_loop_id: Optional[int] = None
+
 
 def _norm_symbol(symbol: str) -> str:
     return symbol.replace("-", "").replace("/", "").upper()
 
 
 def _get_client(*, futures: bool, timeout: float) -> httpx.AsyncClient:
-    global _client_spot, _client_futures
+    global _client_spot, _client_futures, _client_spot_loop_id, _client_futures_loop_id
+
+    loop_id: Optional[int]
+    try:
+        loop_id = id(asyncio.get_running_loop())
+    except RuntimeError:
+        # No running loop (shouldn't happen in our async usage); don't pin.
+        loop_id = None
+
     if futures:
-        if _client_futures is None or _client_futures.is_closed:
+        if (
+            _client_futures is None
+            or _client_futures.is_closed
+            or (_client_futures_loop_id is not None and loop_id is not None and _client_futures_loop_id != loop_id)
+        ):
+            if _client_futures is not None and not _client_futures.is_closed:
+                try:
+                    asyncio.create_task(_client_futures.aclose())
+                except Exception:
+                    pass
             _client_futures = httpx.AsyncClient(timeout=timeout)
+            _client_futures_loop_id = loop_id
         return _client_futures
-    if _client_spot is None or _client_spot.is_closed:
+    if (
+        _client_spot is None
+        or _client_spot.is_closed
+        or (_client_spot_loop_id is not None and loop_id is not None and _client_spot_loop_id != loop_id)
+    ):
+        if _client_spot is not None and not _client_spot.is_closed:
+            try:
+                asyncio.create_task(_client_spot.aclose())
+            except Exception:
+                pass
         _client_spot = httpx.AsyncClient(timeout=timeout)
+        _client_spot_loop_id = loop_id
     return _client_spot
 
 
