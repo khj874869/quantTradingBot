@@ -151,7 +151,13 @@ BOT_MODE=live
 BOT_VENUE=upbit   # or binance / namoo / kis
 BOT_SYMBOLS=KRW-BTC
 BOT_NOTIONAL=100000
+심볼규정
+python -m quantbot.preflight --venue binance_futures --symbol ETHUSDT
+규칙완화 스캘핑
+python -m quantbot.main --mode live --venue binance_futures --strategy scalp --symbols ETHUSDT --entry-tf 1m --poll-sec 5 --notional 25 --leverage 10 --scalp-min-1m-trade-value 0 --scalp-min-orderbook-notional 0 --scalp-min-vol-surge 1.0 --scalp-use-ws-trades 0 --scalp-ws-staleness-sec 30
+
 ```
+
 
 ### 4) 나무증권(나무/QV OpenAPI) 원격 연결 방법
 - 나무/QV OpenAPI는 Windows(32-bit DLL) 제약이 있어, `namoo_bridge/`를 **Windows PC**에서 실행하고
@@ -183,3 +189,6 @@ python -m quantbot.multi_runner multi_run_binance_demo_v1_aggressive.json
 
 # v2 보수형
 python -m quantbot.multi_runner multi_run_binance_demo_v2_conservative.json
+```
+##  실주문 전송 후 첫 진입 안 잡힐때
+python -m quantbot.main --mode live --venue binance_futures --strategy scalp --symbols ETHUSDT --entry-tf 1m --poll-sec 5 --notional 25 --leverage 10 --scalp-use-ws-trades 0 --scalp-ws-staleness-sec 30 --scalp-min-1m-trade-value 0 --scalp-min-orderbook-notional 0 --scalp-min-vol-surge 1.0 --scalp-trade-pressure-threshold 0.0 --scalp-min-flow-notional-rate 0 --scalp-max-spread-bps 12 --scalp-max-1m-range-pct 1.2 --scalp-use-rsi-cross 0 --scalp-require-reversal-candle 0 --scalp-rsi-long-trigger 42 --scalp-rsi-short-min 58 --scalp-rsi-short-max 90

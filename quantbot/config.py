@@ -11,11 +11,11 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
     TIMEZONE: str = "Asia/Seoul"
 
-    # Safety switch: live orders are sent ONLY when true
-    TRADING_ENABLED: bool = False
-
-    MAX_POSITION_PER_SYMBOL: float = 0.10
-    MAX_DAILY_LOSS: float = 0.03
+    # Safety switch: live orders are sent ONLY when true 실주문 켤때만
+    TRADING_ENABLED: bool = True  
+    #0.10이였음 포지션이 너무 잡히지 않아 1로 수정함 Daily loss의 원 값은 float0.03
+    MAX_POSITION_PER_SYMBOL: int = 3
+    MAX_DAILY_LOSS: float = 0.05  
 
     # --- Multi-bot / multi-portfolio risk (optional) ---
     # If you run multiple bot processes (binance futures + upbit + stocks, etc.),
